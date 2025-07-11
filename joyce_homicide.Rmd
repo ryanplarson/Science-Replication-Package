@@ -1,0 +1,2675 @@
+---
+title: "Homicide - Hennepin/Ramsey"
+author: "Ryan Larson, PhD"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+header-includes: \usepackage{dcolumn}
+---
+
+```{r setup, include=FALSE, message=F}
+library(covmobility)
+library(covdata)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(astsa)
+library(tseries)
+library(tigris)
+library(tidycensus)
+library(sf)
+library(purrr)
+library(imputeTS)
+library(rnoaa)
+library(ISOweek)
+library(ggmap)
+library(ggrepel)
+library(suncalc)
+library(stargazer)
+library(tidyquant)
+library(googlesheets4)
+
+
+
+google_key <- readRDS("GOOGLE KEY HERE")
+register_google(key = google_key)
+sf::sf_use_s2(FALSE)
+```
+
+# Base Panel Construction - Tract-Week Level
+
+## Spatial Data
+
+```{r, message=FALSE, warning=FALSE}
+#MN tracts
+tracts <- tracts(state = "MN", cb = F, year = 2020, progress_bar = F)
+
+#Hennepin and Ramsey County 
+
+#dissolved
+county <- counties(state = "MN", cb = F, year = 2020, progress_bar = F) %>%
+  filter(NAME %in% c("Hennepin", "Ramsey")) %>%
+  st_union() 
+
+#hennepin
+hennepin <- counties(state = "MN", cb = F, year = 2020, progress_bar = F) %>%
+  filter(NAME %in% c("Hennepin"))
+
+#ramsey
+ramsey <- counties(state = "MN", cb = F, year = 2020, progress_bar = F) %>%
+  filter(NAME %in% c("Ramsey"))
+
+#Minneapolis and St. Paul 
+
+#dissolved
+mpls_stp <- places(state = "MN", cb = F, year = 2020, progress_bar = F) %>%
+  filter(NAME %in% c("Minneapolis", "St. Paul")) %>%
+  st_union() 
+
+#minneapolis
+mpls <- places(state = "MN", cb = F, year = 2020, progress_bar = F) %>%
+  filter(NAME %in% c("Minneapolis")) 
+
+#st. paul
+stp <- places(state = "MN", cb = F, year = 2020, progress_bar = F) %>%
+  filter(NAME %in% c("St. Paul")) 
+
+#Hennepin/Ramsey Tracts
+  #tract intersection indicators
+hr_tracts <- tracts %>%
+  select(GEOID, geometry) %>%
+  st_filter(county, .predicate = st_within) %>%
+  mutate(tract_area = as.numeric(st_area(.)),
+         tract_area_sqkm = tract_area*.000001, 
+         tract_area_sqmi = tract_area_sqkm*.386102,
+         intersect_msp = ifelse(lengths(st_intersects(., mpls_stp))>0,1,0),
+         within_hennepin = ifelse(lengths(st_within(., hennepin))>0,1,0),
+         within_ramsey = ifelse(lengths(st_within(., ramsey))>0,1,0))
+
+#Hennepin/Ramsey Tracts
+  #tract intersection indicators
+msp_tracts <- tracts %>%
+  select(GEOID, geometry) %>%
+  st_filter(mpls_stp, .predicate = st_within) %>%
+  mutate(tract_area = as.numeric(st_area(.)),
+         tract_area_sqkm = tract_area*.000001, 
+         tract_area_sqmi = tract_area_sqkm*.386102,
+         intersect_msp = ifelse(lengths(st_intersects(., mpls_stp))>0,1,0),
+         within_hennepin = ifelse(lengths(st_within(., hennepin))>0,1,0),
+         within_ramsey = ifelse(lengths(st_within(., ramsey))>0,1,0))
+
+#summative 2020 total pops for paper prose
+
+county_acs <- get_acs(
+  geography = "county",
+  year = 2020,
+  variables = c("B01001_001E"),
+  state = "MN",
+  county = c("Hennepin", "Ramsey"))
+
+sum(county_acs$estimate)
+
+
+
+#spatial nesting check
+ggplot()+
+  geom_sf(data = hr_tracts, aes(geometry=geometry))+
+  geom_sf(data = county, aes(geometry=geometry), color = "green", fill = NA)+
+  geom_sf(data = mpls_stp, aes(geometry=geometry), color = "blue", fill = NA)
+```
+
+## Homicide Data - The Violence Project: Joyce Grant
+
+```{r Joyce homicide data, message=FALSE, warning=FALSE}
+#joyce coded homicide data link
+url <- "URL" #contact the Violence Prevention Project for Access
+
+joyce <- read_sheet(ss = url, sheet = "FULL DATA") %>%
+  filter(is.na(`Police Shooting (0/1)`) |
+         `Police Shooting (0/1)` == 0)  #n=22 known 
+          
+joyce %>%
+  filter(is.na(LATITUDE)|is.na(LONGITUDE))%>%
+  tally() #3 homicides with missing lat or lon
+
+joyce_tract <- joyce %>%
+  mutate(date = ymd(`Homicide Date`),
+         year = isoyear(date),
+         month = month(date),
+         week = isoweek(date)) %>%
+  drop_na(LATITUDE, LONGITUDE) %>% #remove 3 missing coordinate
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = "NAD83", remove=F) %>%
+  st_filter(county) %>% #removing 5 homicides outside of H/R
+  st_join(hr_tracts, join = st_intersects) #spatial join GEOID
+
+#LONLAT visual check#LONLAT st_intersection()visual check
+ggplot()+
+  geom_sf(data = hr_tracts, aes(geometry=geometry))+
+  geom_sf(data = county, aes(geometry=geometry), color = "green", fill = NA)+
+  geom_sf(data = mpls_stp, aes(geometry=geometry), color = "blue", fill = NA)+
+  geom_sf(data = joyce_tract, aes(geometry=geometry), size = .4, color = "red")
+```
+
+```{r}
+# panel dimensions (tracts*year)*52-(3*tracts), adjusting for 53 isoweek in 2020
+panel_n <- length(hr_tracts$GEOID)*length(table(joyce_tract$year))*53-(4*length(hr_tracts$GEOID))
+
+#aggregating joyce data to tract-week-level
+joyce_agg <- joyce_tract %>%
+  st_drop_geometry() %>%
+  group_by(year, week, GEOID, .drop=F) %>%
+  tally(name = "homicide") %>%
+  ungroup() %>%
+  complete(year = c(2018:2022), week = c(1:53), #padding panel
+           GEOID=hr_tracts$GEOID, 
+           fill = list(homicide = 0)) %>%
+  filter(!(week==53 & year %in% c(2018, 2019, 2021, 2022)))
+
+#vehicular homicide aggregation
+joyce_vh <- joyce_tract %>%
+  st_drop_geometry() %>%
+  filter(`Offender Weapon Used`=="Vehicle") %>%
+  group_by(year, week, GEOID, .drop=F) %>%
+  tally(name = "homicide_vh") %>%
+  ungroup() %>%
+  complete(year = c(2018:2022), week = c(1:53), #padding panel
+           GEOID=hr_tracts$GEOID, 
+           fill = list(homicide_vh = 0)) %>%
+  filter(!(week==53 & year %in% c(2018, 2019, 2021, 2022)))
+
+# victim age-graded homicide counts
+joyce_vic_age <- joyce_tract %>%
+  st_drop_geometry() %>%
+  mutate(vic_age_num = ifelse(str_detect(`Victim Age`, pattern = "months|weeks|Unborn"),
+                              0,
+                              as.numeric(`Victim Age`)),
+         vic_18_plus = ifelse(vic_age_num <= 18, "youth_homicide_vic", "adult_homicide_vic")) %>%
+  group_by(year, week, GEOID, vic_18_plus, .drop=F) %>%
+  tally(name = "homicide") %>%
+  ungroup() %>%
+  complete(year = c(2018:2022), week = c(1:53), #padding panel
+           GEOID=hr_tracts$GEOID,
+           vic_18_plus = c("adult_homicide_vic", "youth_homicide_vic"),
+           fill = list(homicide = 0)) %>%
+  filter(!(week==53 & year %in% c(2018, 2019, 2021, 2022))) %>%
+  pivot_wider(names_from = "vic_18_plus", values_from = "homicide")
+
+#create 25+ cut
+
+# perpetrator age-graded homicide counts (n = 218 missing age)
+joyce_perp_age <- joyce_tract %>%
+  st_drop_geometry() %>%
+  filter(!is.na(`Offender Age`)) %>%
+  mutate(perp_18_plus = ifelse(`Offender Age` <= 18, "youth_homicide_perp", 
+                               "adult_homicide_perp")) %>%
+  group_by(year, week, GEOID, perp_18_plus, .drop=F) %>%
+  tally(name = "homicide") %>%
+  ungroup() %>%
+  complete(year = c(2018:2022), week = c(1:53), #padding panel
+           GEOID=hr_tracts$GEOID,
+           perp_18_plus = c("adult_homicide_perp", "youth_homicide_perp"),
+           fill = list(homicide = 0)) %>%
+  filter(!(week==53 & year %in% c(2018, 2019, 2021, 2022))) %>%
+  pivot_wider(names_from = "perp_18_plus", values_from = "homicide")
+
+
+# circumstance-graded homicide counts (n = 218 missing age)
+joyce_circumstance <- joyce_tract %>%
+  st_drop_geometry() %>%
+  mutate(argument_flag = ifelse(str_detect(`CIRCUMSTANCE  1`, pattern="Argument")| 
+                                str_detect(`CIRCUMSTANCE  2`, pattern="Argument")|
+                                str_detect(`CIRCUMSTANCE  3`, pattern="Argument"),
+                                1, 0),
+         argument_flag = ifelse(is.na(argument_flag), 0, argument_flag),
+         crime_flag = ifelse(str_detect(`CIRCUMSTANCE  1`, 
+                                         pattern="Drive by|Drug deal|Retaliation|Gang|Robbery")| #robbery add
+                                str_detect(`CIRCUMSTANCE  2`, 
+                                           pattern="Drive by|Drug deal|Retaliation|Gang|Robbery")|
+                                str_detect(`CIRCUMSTANCE  3`, 
+                                           pattern="Drive by|Drug deal|Retaliation|Gang|Robbery"),
+                                1, 0),
+         crime_flag = ifelse(is.na(crime_flag), 0, crime_flag),
+         domestic_flag = ifelse(str_detect(`CIRCUMSTANCE  1`, 
+                                         pattern="Domestic")|
+                                str_detect(`CIRCUMSTANCE  2`, 
+                                           pattern="Domestic")|
+                                str_detect(`CIRCUMSTANCE  3`, 
+                                           pattern="Domestic"),
+                                1, 0),
+         domestic_flag = ifelse(is.na(domestic_flag), 0, domestic_flag),
+         other_flag = ifelse(str_detect(`CIRCUMSTANCE  1`, 
+                                pattern="Drive by|Drug deal|Retaliation|Gang|Robbery|Domestic")|
+                                str_detect(`CIRCUMSTANCE  2`, 
+                                pattern="Drive by|Drug deal|Retaliation|Gang|Robbery|Domestic")|
+                                str_detect(`CIRCUMSTANCE  3`, 
+                                pattern="Drive by|Drug deal|Retaliation|Gang|Domestic"),
+                                0, 1)) %>%
+  group_by(year, week, GEOID, .drop=F) %>%
+  summarize(homicide_argument = sum(argument_flag, na.rm = T),
+            homicide_crime = sum(crime_flag, na.rm = T),
+            homicide_domestic = sum(domestic_flag, na.rm = T),
+            homicide_other = sum(other_flag, na.rm = T)) %>%
+  ungroup() %>%
+  complete(year = c(2018:2022), week = c(1:53), #padding panel
+           GEOID=hr_tracts$GEOID,
+           fill = list(homicide_argument = 0,
+                       homicide_crime = 0,
+                       homicide_domestic = 0,
+                       homicide_other = 0)) %>%
+  filter(!(week==53 & year %in% c(2018, 2019, 2021, 2022))) 
+
+#weapon-graded (firearm/non-firearm)
+joyce_weapon <- joyce_tract %>%
+  st_drop_geometry() %>%
+  mutate(firearm_flag = ifelse(`Offender Weapon Used`=="Firearm",
+                                1, 
+                                0),
+         nonfirearm_flag = ifelse(`Offender Weapon Used`=="Firearm",
+                                0, 
+                                1)) %>%
+  group_by(year, week, GEOID, .drop=F) %>%
+  summarize(homicide_firearm = sum(firearm_flag, na.rm = T),
+            homicide_nonfirearm = sum(nonfirearm_flag, na.rm = T)) %>%
+  ungroup() %>%
+  complete(year = c(2018:2022), week = c(1:53), #padding panel
+           GEOID=hr_tracts$GEOID,
+           fill = list(homicide_firearm = 0,
+                       homicide_nonfirearm = 0)) %>%
+  filter(!(week==53 & year %in% c(2018, 2019, 2021, 2022))) 
+
+#ageXweapon-graded counts
+joyce_weapon_age <- joyce_tract %>%
+  st_drop_geometry() %>%
+  mutate(firearm_youth_flag = ifelse(`Offender Weapon Used`=="Firearm" &
+                                       `Offender Age` <=18,
+                                1, 
+                                0),
+         nonfirearm_youth_flag = ifelse(`Offender Weapon Used`!="Firearm" &
+                                       `Offender Age` <=18,
+                                1, 
+                                0),
+         firearm_adult_flag = ifelse(`Offender Weapon Used`=="Firearm" &
+                                       `Offender Age` >18,
+                                1, 
+                                0),
+         nonfirearm_adult_flag = ifelse(`Offender Weapon Used`!="Firearm" &
+                                       `Offender Age` >18,
+                                1, 
+                                0)) %>%
+  group_by(year, week, GEOID, .drop=F) %>%
+  summarize(homicide_firearm_youth = sum(firearm_youth_flag, na.rm = T),
+            homicide_nonfirearm_youth = sum(nonfirearm_youth_flag, na.rm = T),
+            homicide_firearm_adult = sum(firearm_adult_flag, na.rm = T),
+            homicide_nonfirearm_adult = sum(nonfirearm_adult_flag, na.rm = T)) %>%
+  ungroup() %>%
+  complete(year = c(2018:2022), week = c(1:53), #padding panel
+           GEOID=hr_tracts$GEOID,
+           fill = list(homicide_firearm_youth = 0,
+            homicide_nonfirearm_youth = 0,
+            homicide_firearm_adult = 0,
+            homicide_nonfirearm_adult = 0)) %>%
+  filter(!(week==53 & year %in% c(2018, 2019, 2021, 2022))) 
+
+#merging spatial data
+joyce_panel <- joyce_agg %>%
+  left_join(hr_tracts, by = c("GEOID")) %>%
+  left_join(joyce_vh, by = c("GEOID", "year", "week")) %>%
+  left_join(joyce_vic_age, by = c("GEOID", "year", "week")) %>%
+  left_join(joyce_perp_age, by = c("GEOID", "year", "week")) %>%
+  left_join(joyce_circumstance, by = c("GEOID", "year", "week")) %>%
+  left_join(joyce_weapon, by = c("GEOID", "year", "week")) %>%
+  left_join(joyce_weapon_age, by = c("GEOID", "year", "week")) %>%
+  st_as_sf() 
+```
+
+## American Community Survey Data - 5-Year Estimates
+
+```{r}
+census_api_key("YOUR CENSUS API KEY HERE")
+
+year <- lst(2020, 2021, 2022)
+
+#scraping 2020, 2021, 2022 ACS tract-level data
+acs_20_22 <- map_dfr(
+  year,
+  ~ get_acs(geography = "tract", 
+            state = "MN",
+               variables = c("B01001_001E", "B03002_003E", "B03002_004E", "B03002_005E",
+                             "B03002_006E", "B03002_007E", "B03002_008E", "B03002_009E",
+                             "B03002_010E", "B03002_011E", "B03002_012E", "B23025_002E",
+                             "B23025_005E", "B17001_002E", "B19057_002E", "B11003_015E", 
+                             "B06009_002E", "B06009_005E", "C24010_001E", "C24010_003E",
+                             "C24010_039E", "B11001_003E", "B01001_002E", "B05001_006E",
+                             "B01001_003E", "B01001_004E", "B01001_005E", "B01001_006E",
+                             "B01001_007E", "B01001_008E", "B01001_009E", "B01001_010E",
+                             "B01001_011E", "B01001_012E", "B01001_013E", "B01001_014E",
+                             "B01001_015E", "B01001_016E", "B01001_017E", "B01001_018E",
+                             "B01001_019E", "B01001_020E", "B01001_021E", "B01001_022E",
+                             "B01001_023E", "B01001_024E", "B01001_025E", "B01001_027E",
+                             "B01001_028E", "B01001_029E", "B01001_030E", "B01001_031E",
+                             "B01001_032E", "B01001_033E", "B01001_034E", "B01001_035E",
+                             "B01001_036E", "B01001_037E", "B01001_038E", "B01001_039E",
+                             "B01001_040E", "B01001_041E", "B01001_042E", "B01001_043E",
+                             "B01001_044E", "B01001_045E", "B01001_046E", "B01001_047E", 
+                             "B01001_048E", "B01001_049E", "B07001_017E", "B25003_002E",
+                             "B05002_013E", "B19013_001E"),
+               output = "wide",
+               survey = "acs5",
+               year = .x),  .id = "year") %>%
+  select(-ends_with("M", ignore.case = F)) %>%
+  filter(GEOID %in% hr_tracts$GEOID)
+
+
+###############################################
+#population weighted interpolation for 2018 and 2019 ACS to match 2020 tract boundaries
+
+
+#acs 2020 for interpolation target
+acs_20 <- get_acs(geography = "tract", 
+                  state = "MN",
+                  year = 2020,
+               variables = c("B01001_001E", "B03002_003E", "B03002_004E", "B03002_005E",
+                             "B03002_006E", "B03002_007E", "B03002_008E", "B03002_009E",
+                             "B03002_010E", "B03002_011E", "B03002_012E", "B23025_002E",
+                             "B23025_005E", "B17001_002E", "B19057_002E", "B11003_015E", 
+                             "B06009_002E", "B06009_005E", "C24010_001E", "C24010_003E",
+                             "C24010_039E", "B11001_003E", "B01001_002E", "B05001_006E",
+                             "B01001_003E", "B01001_004E", "B01001_005E", "B01001_006E",
+                             "B01001_007E", "B01001_008E", "B01001_009E", "B01001_010E",
+                             "B01001_011E", "B01001_012E", "B01001_013E", "B01001_014E",
+                             "B01001_015E", "B01001_016E", "B01001_017E", "B01001_018E",
+                             "B01001_019E", "B01001_020E", "B01001_021E", "B01001_022E",
+                             "B01001_023E", "B01001_024E", "B01001_025E", "B01001_027E",
+                             "B01001_028E", "B01001_029E", "B01001_030E", "B01001_031E",
+                             "B01001_032E", "B01001_033E", "B01001_034E", "B01001_035E",
+                             "B01001_036E", "B01001_037E", "B01001_038E", "B01001_039E",
+                             "B01001_040E", "B01001_041E", "B01001_042E", "B01001_043E",
+                             "B01001_044E", "B01001_045E", "B01001_046E", "B01001_047E", 
+                             "B01001_048E", "B01001_049E", "B07001_017E", "B25003_002E",
+                             "B05002_013E", "B19013_001E"),
+               output = "wide",
+               survey = "acs5",
+               geometry = T) %>%
+  select(-ends_with("M", ignore.case = F)) 
+
+
+#2018 acs
+acs_18 <- get_acs(geography = "tract", 
+                  state = "MN",
+                  year = 2018,
+               variables = c("B01001_001E", "B03002_003E", "B03002_004E", "B03002_005E",
+                             "B03002_006E", "B03002_007E", "B03002_008E", "B03002_009E",
+                             "B03002_010E", "B03002_011E", "B03002_012E", "B23025_002E",
+                             "B23025_005E", "B17001_002E", "B19057_002E", "B11003_015E", 
+                             "B06009_002E", "B06009_005E", "C24010_001E", "C24010_003E",
+                             "C24010_039E", "B11001_003E", "B01001_002E", "B05001_006E",
+                             "B01001_003E", "B01001_004E", "B01001_005E", "B01001_006E",
+                             "B01001_007E", "B01001_008E", "B01001_009E", "B01001_010E",
+                             "B01001_011E", "B01001_012E", "B01001_013E", "B01001_014E",
+                             "B01001_015E", "B01001_016E", "B01001_017E", "B01001_018E",
+                             "B01001_019E", "B01001_020E", "B01001_021E", "B01001_022E",
+                             "B01001_023E", "B01001_024E", "B01001_025E", "B01001_027E",
+                             "B01001_028E", "B01001_029E", "B01001_030E", "B01001_031E",
+                             "B01001_032E", "B01001_033E", "B01001_034E", "B01001_035E",
+                             "B01001_036E", "B01001_037E", "B01001_038E", "B01001_039E",
+                             "B01001_040E", "B01001_041E", "B01001_042E", "B01001_043E",
+                             "B01001_044E", "B01001_045E", "B01001_046E", "B01001_047E", 
+                             "B01001_048E", "B01001_049E", "B07001_017E", "B25003_002E",
+                             "B05002_013E", "B19013_001E"),
+               output = "wide",
+               survey = "acs5",
+               geometry = T) %>%
+    select(-ends_with("M", ignore.case = F)) 
+
+
+hr_blocks <- tigris::blocks(
+  state = "MN",
+  county = c("Hennepin", "Ramsey"),
+  year = 2020
+) 
+
+acs_18_interp <- interpolate_pw(
+  from = acs_18,
+  to = acs_20,
+  to_id = "GEOID",
+  weights = hr_blocks,
+  weight_column = "POP20",
+  extensive = T,
+  crs = 4269
+) %>%
+  mutate(year="2018") %>%
+  filter(GEOID %in% hr_tracts$GEOID)
+
+#2019 acs
+acs_19 <- get_acs(geography = "tract", 
+                  state = "MN",
+                  year = 2019,
+               variables = c("B01001_001E", "B03002_003E", "B03002_004E", "B03002_005E",
+                             "B03002_006E", "B03002_007E", "B03002_008E", "B03002_009E",
+                             "B03002_010E", "B03002_011E", "B03002_012E", "B23025_002E",
+                             "B23025_005E", "B17001_002E", "B19057_002E", "B11003_015E", 
+                             "B06009_002E", "B06009_005E", "C24010_001E", "C24010_003E",
+                             "C24010_039E", "B11001_003E", "B01001_002E", "B05001_006E",
+                             "B01001_003E", "B01001_004E", "B01001_005E", "B01001_006E",
+                             "B01001_007E", "B01001_008E", "B01001_009E", "B01001_010E",
+                             "B01001_011E", "B01001_012E", "B01001_013E", "B01001_014E",
+                             "B01001_015E", "B01001_016E", "B01001_017E", "B01001_018E",
+                             "B01001_019E", "B01001_020E", "B01001_021E", "B01001_022E",
+                             "B01001_023E", "B01001_024E", "B01001_025E", "B01001_027E",
+                             "B01001_028E", "B01001_029E", "B01001_030E", "B01001_031E",
+                             "B01001_032E", "B01001_033E", "B01001_034E", "B01001_035E",
+                             "B01001_036E", "B01001_037E", "B01001_038E", "B01001_039E",
+                             "B01001_040E", "B01001_041E", "B01001_042E", "B01001_043E",
+                             "B01001_044E", "B01001_045E", "B01001_046E", "B01001_047E", 
+                             "B01001_048E", "B01001_049E", "B07001_017E", "B25003_002E",
+                             "B05002_013E", "B19013_001E"),
+               output = "wide",
+               survey = "acs5",
+               geometry = T) %>%
+    select(-ends_with("M", ignore.case = F))
+
+acs_19_interp <- interpolate_pw(
+  from = acs_19,
+  to = acs_20,
+  to_id = "GEOID",
+  weights = hr_blocks,
+  weight_column = "POP20",
+  extensive = T,
+  crs = 4269
+) %>%
+  mutate(year="2019") %>%
+  filter(GEOID %in% hr_tracts$GEOID)
+
+
+
+
+acs <- acs_20_22 %>%
+  bind_rows(acs_18_interp) %>%
+  bind_rows(acs_19_interp) %>%
+  rename(total_pop = B01001_001E, white_pop = B03002_003E, black_pop = B03002_004E,
+         na_pop = B03002_005E, asian_pop = B03002_006E, hpi_pop = B03002_007E,
+         other_pop = B03002_008E, biracial_pop = B03002_009E, biracial_other_pop = B03002_010E,
+         biracial_three_pop = B03002_011E, hisp_pop = B03002_012E, total_ilf = B23025_002E,
+         unemp = B23025_005E, povlevel = B17001_002E, pub_assist = B19057_002E,
+         female_hh = B11003_015E, no_hs_dip = B06009_002E, bach_degree = B06009_005E,
+         total_employed = C24010_001E, employed_mbsa_male = C24010_003E,
+         employed_mbsa_female = C24010_039E, mar_fam = B11001_003E, male = B01001_002E,
+         noncitizen = B05001_006E,
+        age_m_5_under = B01001_003E, age_m_5_9 = B01001_004E, age_m_10_14 = B01001_005E, 
+        age_m_15_17 = B01001_006E, age_m_18_19 = B01001_007E, age_m_20 = B01001_008E,
+        age_m_21 = B01001_009E, age_m_22_24 = B01001_010E, age_m_25_29 = B01001_011E, #try adult cut at 29
+        age_m_30_34 = B01001_012E, age_m_35_39 = B01001_013E, age_m_40_44 = B01001_014E,
+        age_m_45_49 = B01001_015E, age_m_50_54 = B01001_016E, age_m_55_59 = B01001_017E, 
+        age_m_60_61 = B01001_018E, age_m_62_64 = B01001_019E, age_m_65_66 = B01001_020E,
+        age_m_67_69 = B01001_021E, age_m_70_74 = B01001_022E, age_m_75_79 = B01001_023E, 
+        age_m_80_84 = B01001_024E, age_m_85_plus = B01001_025E, age_f_5_under = B01001_027E,
+        age_f_5_9 = B01001_028E, age_f_10_14 = B01001_029E, age_f_15_17 = B01001_030E, 
+        age_f_18_19 = B01001_031E, age_f_20 = B01001_032E, age_f_21 = B01001_033E,
+        age_f_22_24 = B01001_034E, age_f_25_29 = B01001_035E, age_f_30_34 = B01001_036E, 
+        age_f_35_39 = B01001_037E, age_f_40_44 = B01001_038E, age_f_45_49 = B01001_039E,
+        age_f_50_54 = B01001_040E, age_f_55_59 = B01001_041E, age_f_60_61 = B01001_042E, 
+        age_f_62_64 = B01001_043E, age_f_65_66 = B01001_044E, age_f_67_69 = B01001_045E, 
+        age_f_70_74 = B01001_046E, age_f_75_79 = B01001_047E, age_f_80_84 = B01001_048E, 
+        age_f_85_plus = B01001_049E, res_mob = B07001_017E, 
+        own_hh = B25003_002E, foreign = B05002_013E,
+        med_hh_inc = B19013_001E) %>%
+  mutate(white_prop = white_pop/total_pop,
+         black_prop = black_pop/total_pop,
+         na_prop = na_pop/total_pop,
+         asian_prop = asian_pop/total_pop,
+         hpi_prop = hpi_pop/total_pop,
+         other_prop = other_pop/total_pop,
+         biracial_prop = (biracial_pop+biracial_other_pop+biracial_three_pop)/total_pop,
+         hisp_prop = hisp_pop/total_pop,
+         white_perc = 100*white_pop/total_pop,
+         black_perc = 100*black_pop/total_pop,
+         na_perc = 100*na_pop/total_pop,
+         asian_perc = 100*asian_pop/total_pop,
+         hpi_perc = 100*hpi_pop/total_pop,
+         other_perc = 100*other_pop/total_pop,
+         biracial_perc = 100*(biracial_pop+biracial_other_pop+biracial_three_pop)/total_pop,
+         hisp_perc = 100*hisp_pop/total_pop,
+         unemp_rate = 100*unemp/total_ilf, 
+         pov_rate = 100*povlevel/total_pop,
+         pub_assist_rate = 100*pub_assist/total_pop,
+         female_hh_rate = 100*female_hh/total_pop,
+         no_hs_dip_rate = 100*no_hs_dip/total_pop,
+         bach_degree_rate = 100*bach_degree/total_pop,
+         employed_mbsa = employed_mbsa_male+employed_mbsa_female,
+         employed_mbsa_rate = 100*employed_mbsa/total_employed,
+         mar_fam_rate = 100*mar_fam/total_pop, 
+         male_rate = 100*male/total_pop,
+         noncitizen_rate = 100*noncitizen/total_pop,
+         race_eth_hetero  = 1-(white_prop^2+black_prop^2+na_prop^2+asian_prop^2+
+                       hpi_prop^2+other_prop^2+other_prop^2+biracial_prop^2+hisp_prop^2),
+         pop_below_18 = age_m_5_under+age_f_5_under+age_m_5_9+
+                                  age_f_5_9+age_m_10_14+age_f_10_14+age_m_15_17+
+                                  age_f_15_17,
+         pop_above_18 = total_pop-pop_below_18,
+         age_below_18_perc = 100*(age_m_5_under+age_f_5_under+age_m_5_9+
+                                  age_f_5_9+age_m_10_14+age_f_10_14+age_m_15_17+
+                                  age_f_15_17)/total_pop,
+         age_19_29_perc = 100*(age_m_18_19+age_f_18_19+age_m_20+age_f_20+age_m_21+age_f_21+
+                          age_m_22_24+age_f_22_24+age_m_25_29+age_f_25_29)/total_pop,
+         age_30_49_perc = 100*(age_m_30_34+age_f_30_34+age_m_35_39+age_f_35_39+
+                               age_m_40_44+age_f_40_44+age_m_45_49+age_f_45_49)/total_pop,
+         age_50_69_perc = 100*(age_m_50_54+age_f_50_54+age_m_55_59+age_f_55_59+
+                               age_m_60_61+age_f_60_61+age_m_62_64+age_f_62_64+
+                               age_m_65_66+age_f_65_66+age_m_67_69+age_f_67_69)/total_pop,
+         age_70_plus_perc = 100*(age_m_70_74+age_f_70_74+age_m_75_79+age_f_75_79+
+                                 age_m_80_84+age_f_80_84+age_m_85_plus+age_f_85_plus)/total_pop,
+         res_mob_rate = 100-100*res_mob/total_pop,
+         own_hh_rate = 100*own_hh/total_pop,
+         foreign_rate = 100*foreign/total_pop) %>%
+  mutate(year = as.numeric(year)) %>%
+  select(-geometry) %>%
+  st_drop_geometry()
+
+
+#merging spatial data
+joyce_panel <- joyce_panel %>%
+  left_join(acs, by = c("GEOID", "year")) %>%
+  arrange(year, GEOID, week)
+```
+
+# Hennepin/Ramsey Combined Time Series Build and Analysis
+
+## Time Series Build
+
+### Aggregate Panel to Week-Level
+
+```{r, message=FALSE}
+joyce_series <- joyce_panel %>%
+  st_drop_geometry() %>%
+  group_by(year, week) %>%
+  summarize(homicide = sum(homicide, na.rm = T),
+            adult_homicide_vic = sum(adult_homicide_vic, na.rm = T),
+            youth_homicide_vic = sum(youth_homicide_vic, na.rm = T),
+            adult_homicide_perp = sum(adult_homicide_perp, na.rm = T),
+            youth_homicide_perp = sum(youth_homicide_perp, na.rm = T),
+            homicide_argument = sum(homicide_argument, na.rm = T),
+            homicide_crime = sum(homicide_crime, na.rm = T),
+            homicide_domestic = sum(homicide_domestic, na.rm = T),
+            homicide_other = sum(homicide_other, na.rm = T),
+            homicide_firearm = sum(homicide_firearm, na.rm = T),
+            homicide_nonfirearm = sum(homicide_nonfirearm, na.rm = T),
+            homicide_firearm_youth = sum(homicide_firearm_youth, na.rm = T),
+            homicide_nonfirearm_youth = sum(homicide_nonfirearm_youth, na.rm = T),
+            homicide_firearm_adult = sum(homicide_firearm_adult, na.rm = T),
+            homicide_nonfirearm_adult = sum(homicide_nonfirearm_adult, na.rm = T),
+            homicide_vh = sum(homicide_vh, na.rm = T),
+            total_pop = sum(total_pop, na.rm = T),
+            pop_above_18 = sum(pop_above_18, na.rm = T),
+            pop_below_18 = sum(pop_below_18, na.rm = T)) %>%
+  mutate(homicide_rate = (homicide/total_pop)*100000,
+         homicide_rate_adult_vic = (adult_homicide_vic/pop_above_18)*100000,
+         homicide_rate_youth_vic = (youth_homicide_vic/pop_below_18)*100000,
+         homicide_rate_adult_perp = (adult_homicide_perp/pop_above_18)*100000,
+         homicide_rate_youth_perp = (youth_homicide_perp/pop_below_18)*100000,
+         homicide_rate_argument = (homicide_argument/total_pop)*100000,
+         homicide_rate_crime = (homicide_crime/total_pop)*100000,
+         homicide_rate_domestic = (homicide_domestic/total_pop)*100000,
+         homicide_rate_other = (homicide_other/total_pop)*100000,
+         homicide_rate_firearm = (homicide_firearm/total_pop)*100000,
+         homicide_rate_nonfirearm = (homicide_nonfirearm/total_pop)*100000,
+         homicide_rate_vh = (homicide_vh/total_pop)*100000,
+homicide_rate_firearm_youth = (homicide_firearm_youth/pop_below_18)*100000,
+homicide_rate_nonfirearm_youth = (homicide_nonfirearm_youth/pop_below_18)*100000,
+homicide_rate_firearm_adult = (homicide_firearm_adult/pop_above_18)*100000,
+homicide_rate_nonfirearm_adult = (homicide_nonfirearm_adult/pop_above_18)*100000) %>%
+  mutate(begin_date = ISOweek2date(paste(year, 
+                                         paste0("W", 
+                                                sprintf("%02d", week)), 
+                                         1, 
+                                         sep = "-")),
+         end_date = begin_date+weeks(1)-days(1))
+```
+
+### Weather Data
+
+```{r, message=F}
+# Minnesota DNR Daily Date
+ # https://www.dnr.state.mn.us/climate/historical/daily-data.html?sid=mspthr&sname=Minneapolis/St%20Paul%20Threaded%20Record&sdate=2010-01-01&edate=por
+ # Station Name: Minneapolis/St Paul Threaded Record - Station ID: mspthr
+
+weather <- read_csv("Data/dnr_weather.csv") %>%
+  mutate(year=isoyear(Date),
+         week=isoweek(Date),
+         precip_in = as.numeric(ifelse(`Precipitation (inches)`=="T", .001, `Precipitation (inches)`)),
+         snow_in = as.numeric(ifelse(`Snow (inches)`=="T", .001, `Snow (inches)`)),
+         tmax_f = `Maximum Temperature degrees (F)`) %>%
+  filter(year >= 2018 & year <= 2022) %>%
+  select(year, week, precip_in, snow_in, tmax_f) %>%
+  group_by(year, week) %>%
+  summarize(precip_in = mean(precip_in, na.rm = T), 
+            snow_in = mean(snow_in, na.rm = T), 
+            tmax_f = mean(tmax_f, na.rm = T))
+
+#join to series
+joyce_series <- joyce_series %>% 
+  left_join(weather, by = c("year","week"))
+```
+
+
+### New York Times COVID-19 County-Level Case and Mortality Data
+
+```{r}
+nyt_covid_2020 <- read_csv("Data/us-counties-2020.csv")
+nyt_covid_2021 <- read_csv("Data/us-counties-2021.csv")
+nyt_covid_2022 <- read_csv("Data/us-counties-2022.csv")
+
+nytcovcounty <- nyt_covid_2020 %>%
+  bind_rows(nyt_covid_2021) %>%
+  bind_rows(nyt_covid_2022)
+
+covid_hr <- nytcovcounty %>%
+  filter(state=="Minnesota" &
+         county %in% c("Hennepin", "Ramsey")) %>%
+  mutate(year=isoyear(date),
+         week=isoweek(date)) %>%
+  arrange(county, year, week) %>%
+  filter(date >= as.Date("2020-03-12")) %>%
+  group_by(county) %>%
+  mutate(cases_week = ifelse(date==as.Date("2020-03-12"),
+                             cases,
+                             cases-dplyr::lag(cases, 1)),
+         deaths_week = ifelse(date==as.Date("2020-03-12"),
+                             deaths,
+                             deaths-dplyr::lag(deaths, 1))) %>%
+  group_by(year, week) %>%
+  summarize(covid_cases = sum(cases_week, na.rm = T),
+            covid_deaths = sum(deaths_week, na.rm = T)) %>%
+  ungroup() %>%
+  complete(year = 2018:2022, week = 1:52, fill = list(covid_cases = 0,
+                                                      covid_deaths = 0)) %>%
+  arrange(year, week)
+
+joyce_series <- joyce_series %>%
+  left_join(covid_hr, by = c("year", "week")) 
+```
+
+### Google Mobility Data
+
+```{r}
+#pct_diff = percentage change from median baseline mobility 1/3-2/6 2020
+#only available until 10/15/2022 (zeros assumed before/after observed data)
+google_mobility <- read_csv("Data/Global_Mobility_Report.csv")
+
+google_mobility_series <- google_mobility %>%
+  filter(country_region=="United States" & sub_region_1=="Minnesota" &
+         sub_region_2 %in% c("Hennepin County", "Ramsey County")) %>%
+  mutate(year=isoyear(date),
+         week=isoweek(date)) %>%
+  group_by(year, week) %>%
+  summarize(grocery_mobility = mean(retail_and_recreation_percent_change_from_baseline, 
+                                    na.rm = T),
+            retail_mobility = mean(grocery_and_pharmacy_percent_change_from_baseline, 
+                                    na.rm = T),
+            transit_mobility = mean(transit_stations_percent_change_from_baseline, 
+                                    na.rm = T),
+            workplace_mobility = mean(workplaces_percent_change_from_baseline,
+                                      na.rm = T),
+            residential_mobility = mean(residential_percent_change_from_baseline,
+                                        na.rm = T),
+            parks_mobility = mean(parks_percent_change_from_baseline,
+                                  na.rm = T)) %>%
+  ungroup() %>%
+  complete(year = 2018:2022, week = 1:52, fill = list(grocery_mobility = 0,
+                                                            retail_mobility = 0,
+                                                            transit_mobility = 0,
+                                                            workplace_mobility = 0,
+                                                            residential_mobility = 0,
+                                                            parks_mobility = 0)) %>%
+  mutate(avg_mobility = (grocery_mobility+parks_mobility+residential_mobility+retail_mobility+transit_mobility+workplace_mobility)/6)
+
+joyce_series <- joyce_series %>% 
+  left_join(google_mobility_series, by = c("year", "week"))
+```
+
+### Interrupted Time Series Structure
+
+```{r, message = F}
+joyce_series <- joyce_series %>%
+  ungroup() %>%
+  mutate(t = 1:length(homicide_rate),
+         post_floyd = as.factor(as.numeric(begin_date >= as.Date("2020-05-25"))),
+         post_floyd_3 = as.factor(as.numeric(begin_date >= as.Date("2020-05-25") + 
+                                               months(3))),
+         weeks_post = as.numeric(begin_date-as.Date("2020-05-25"))/7,
+         t_post_floyd = ifelse(weeks_post >=0,
+                               weeks_post,
+                               0),
+         delayed_effect = as.factor(as.numeric(begin_date >= as.Date("2020-05-25")+
+                                                 months(13))))
+```
+
+### COVID State-Policy Controls
+
+```{r}
+#Covid timelines
+  #https://docs.google.com/spreadsheets/d/1zu9qEWI8PsOI_i8nI_S29HDGHlIp2lfVMsGxpQ5tvAQ/edit#gid=973655443
+
+joyce_series <- joyce_series %>%
+         ungroup() %>%
+         mutate(stay_at_home = as.factor(as.numeric(begin_date >= as.Date("2020-03-28") &                                                  begin_date <= as.Date("2020-05-28"))),
+         state_of_emerg = as.factor(as.numeric(begin_date >= as.Date("2020-03-13") &
+                                               begin_date <= as.Date("2021-07-1"))),
+         genpub_vaxx = as.factor(as.numeric(begin_date >= as.Date("2021-03-30"))),
+         school_closure = as.factor(as.numeric(begin_date >= as.Date("2020-03-18") &
+                                               begin_date <= as.Date("2021-02-22"))),
+         bar_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-10")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2021-01-11")))),
+         gym_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-10")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2020-12-18")))),
+         movie_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-10")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2021-01-11")))),
+         restaurant_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-01")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2021-01-11")))),
+         business_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-10")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2021-01-11")))))
+```
+
+## Time Series Analysis
+
+### Time Series Vizualization
+
+```{r overall homicide plot, warning=FALSE}
+joyce_series <- joyce_series %>%
+  ungroup() %>%
+  mutate(csma = forecast::ma(homicide_rate, order=5,centre=TRUE), #centered
+         tsma = TTR::SMA(homicide_rate, n=5)) #trailing
+
+t.test(homicide_rate~post_floyd, data = joyce_series,
+       alternative = "two.sided", var.equal = FALSE)
+
+joyce_series$homicide_rate[joyce_series$year==2020 & (joyce_series$week==isoweek(date("2020-05-25")))]/
+joyce_series$homicide_rate[joyce_series$year==2020 & (joyce_series$week==isoweek(date("2020-05-25"))-1)]
+
+
+ggplot(joyce_series)+
+  geom_line(aes(x=begin_date, y=homicide_rate))+ 
+  #geom_line(aes(x=begin_date, y=csma, color = "CSMA(5)"))+
+  geom_line(aes(x=begin_date, y=tsma, color = "TSMA(5)"))+
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-13"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-12-27"))],
+    ymin = 0,
+    ymax = 1,
+    fill = "grey", 
+    alpha = .3) +
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-28"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-05-18"))],
+    ymin = 0,
+    ymax = 1,
+    fill = "red", 
+    alpha = .1) +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "6 months")+
+  geom_vline(xintercept=joyce_series$begin_date[joyce_series$year==2020 &
+                                            joyce_series$week==isoweek(date("2020-05-25"))], 
+              linetype="solid", color="blue", size=.5)+
+  geom_label(aes(x=joyce_series$begin_date[joyce_series$year==2020 &
+                                             joyce_series$week==isoweek(date("2020-05-25"))],
+                 y=1), 
+             label = "George Floyd", show.legend = FALSE)+
+  labs(title = "Figure 1: Weekly Homicides in Hennepin & Ramsey Counties, 2018-2022",
+       subtitle = "Violence Prevention Project Homicide Data",
+       x = "Week",
+       y = "Rate per 100,000 Residents",
+       fill = "MN COVID-19 Policy",
+       color = NULL,
+       caption = "The grey period represents the COVID-19 State of Emergency order, 
+       and the red represents the COVID-19 Stay at Home order.")+
+  theme_classic()+
+    theme(axis.text.x=element_text(angle=45, hjust=1)) 
+```
+
+```{r circumstance homicide plots, warning=FALSE}
+joyce_circumstance_long <- joyce_series %>%
+  select(year, week, 
+         homicide_rate_argument, 
+         homicide_rate_crime,
+         homicide_rate_domestic) %>%
+  pivot_longer(!c(year, week), 
+               names_to = "circumstance", 
+               values_to = "homicide_rate") %>%
+  mutate(circumstance = case_when(
+    circumstance=="homicide_rate_argument" ~ "Argument",
+    circumstance=="homicide_rate_crime" ~ "Crime",
+    circumstance=="homicide_rate_domestic" ~ "Domestic"),
+    begin_date = ISOweek2date(paste(year, 
+                                         paste0("W", 
+                                                sprintf("%02d", week)), 
+                                         1, 
+                                         sep = "-")),
+         end_date = begin_date+weeks(1)-days(1)) %>%
+  group_by(circumstance) %>%
+  mutate(csma = forecast::ma(homicide_rate, order=5,centre=TRUE),
+         tsma = TTR::SMA(homicide_rate, n=5))
+
+
+ggplot(joyce_circumstance_long)+
+  geom_line(aes(x=begin_date, y=homicide_rate))+ 
+  geom_line(aes(x=begin_date, y=tsma, color = "TSMA(5)"))+
+  facet_wrap(~circumstance)+
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-13"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-12-27"))],
+    ymin = 0,
+    ymax = .7,
+    fill = "grey", 
+    alpha = .4) +
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-28"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-05-18"))],
+    ymin = 0,
+    ymax = .7,
+    fill = "Red", 
+    alpha = .4) +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "6 months")+
+  geom_vline(xintercept=joyce_series$begin_date[joyce_series$year==2020 &
+                                            joyce_series$week==isoweek(date("2020-05-25"))], 
+              linetype="solid", color="blue", size=1)+
+  geom_label(aes(x=joyce_series$begin_date[joyce_series$year==2020 &
+                                             joyce_series$week==isoweek(date("2020-05-25"))],
+                 y=.7), 
+             label = "George Floyd", show.legend = FALSE)+
+  labs(title = "Figure X: Weekly Homicides in Hennepin & Ramsey Counties by Circumstance, 2018-2022",
+       subtitle = "Violence Prevention Project Homicide Data",
+       x = "Week",
+       y = "Rate per 100,000 Residents",
+       fill = "MN COVID-19 Policy",
+       color = NULL,
+       caption = "The grey period represents the COVID-19 State of Emergency order, 
+       and the red represents the COVID-19 Stay at Home order.")+
+  theme_classic()+
+    theme(axis.text.x=element_text(angle=45, hjust=1)) 
+```
+
+```{r circumstance 2 homicide plots, warning=FALSE}
+circumstance_plot <- ggplot(joyce_circumstance_long)+
+  #geom_line(aes(x=begin_date, y=homicide_rate, color = circumstance))+ 
+  geom_line(aes(x=begin_date, y=tsma, color = circumstance))+
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-13"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-12-27"))],
+    ymin = 0,
+    ymax = .35,
+    fill = "grey", 
+    alpha = .3) +
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-28"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-05-18"))],
+    ymin = 0,
+    ymax = .35,
+    fill = "Red", 
+    alpha = .1) +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "6 months")+
+  geom_vline(xintercept=joyce_series$begin_date[joyce_series$year==2020 &                                            joyce_series$week==isoweek(date("2020-05-25"))], 
+              linetype="solid", color="blue", size=1)+
+  geom_label(aes(x=joyce_series$begin_date[joyce_series$year==2020 &
+                                             joyce_series$week==isoweek(date("2020-05-25"))],
+                 y=.35), 
+             label = "George Floyd", show.legend = FALSE)+
+  labs(title = "Figure 2: TSMA(5) of Weekly Homicides by Circumstance, Age X Role, and Weapon",
+       subtitle = "Circumstance",
+       x = "",
+       y = "Rate per 100,000 Residents",
+       fill = "MN COVID-19 Policy",
+       color = NULL,
+       caption = "")+
+  theme_classic()+
+    theme(axis.text.x=element_text(angle=45, hjust=1)) 
+```
+
+```{r age role homicide plots, warning=FALSE}
+joyce_role_age_long <- joyce_series %>%
+  select(year, week, 
+         homicide_rate_youth_vic, 
+         homicide_rate_youth_perp,
+         homicide_rate_adult_vic, 
+         homicide_rate_adult_perp) %>%
+  pivot_longer(!c(year, week), 
+               names_to = "role_age", 
+               values_to = "homicide_rate") %>%
+  mutate(role_age = case_when(
+    role_age=="homicide_rate_youth_vic" ~ "Youth Victim",
+    role_age=="homicide_rate_youth_perp" ~ "Youth Perp",
+    role_age=="homicide_rate_adult_vic" ~ "Adult Victim",
+    role_age=="homicide_rate_adult_perp" ~ "Adult Perp"),
+    begin_date = ISOweek2date(paste(year, 
+                                         paste0("W", 
+                                                sprintf("%02d", week)), 
+                                         1, 
+                                         sep = "-")),
+         end_date = begin_date+weeks(1)-days(1)) %>%
+  group_by(role_age) %>%
+  mutate(csma = forecast::ma(homicide_rate, order=5,centre=TRUE),
+         tsma = TTR::SMA(homicide_rate, n=5))
+
+
+ggplot(joyce_role_age_long)+
+  #geom_line(aes(x=begin_date, y=homicide_rate))+ 
+  geom_line(aes(x=begin_date, y=tsma, color = "TSMA(5)"))+
+  facet_wrap(~role_age)+
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-13"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-12-27"))],
+    ymin = 0,
+    ymax = 1,
+    fill = "grey", 
+    alpha = .4) +
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-28"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-05-18"))],
+    ymin = 0,
+    ymax = 1,
+    fill = "Red", 
+    alpha = .4) +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "6 months")+
+  geom_vline(xintercept=joyce_series$begin_date[joyce_series$year==2020 &
+                joyce_series$week==isoweek(date("2020-05-25"))], 
+              linetype="solid", color="blue", size=1)+
+  geom_label(aes(x=joyce_series$begin_date[joyce_series$year==2020 &
+                   joyce_series$week==isoweek(date("2020-05-25"))],
+                 y=1), 
+             label = "George Floyd", show.legend = FALSE)+
+  labs(title = "Weekly Homicides in Hennepin & Ramsey Counties by Role and Age, 2018-2022",
+       subtitle = "Violence Prevention Project Homicide Data",
+       x = "Week",
+       y = "Rate per 100,000 Residents",
+       fill = "MN COVID-19 Policy",
+       color = NULL,
+       caption = "The grey period represents the COVID-19 State of Emergency order, 
+       and the red represents the COVID-19 Stay at Home order.")+
+  theme_classic()+
+    theme(axis.text.x=element_text(angle=45, hjust=1)) 
+
+```
+
+```{r ageXrole plot}
+age_role_plot <- ggplot(joyce_role_age_long)+
+  #geom_line(aes(x=begin_date, y=homicide_rate, color = circumstance))+ 
+  geom_line(aes(x=begin_date, y=tsma, color = role_age))+
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-13"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-12-27"))],
+    ymin = 0,
+    ymax = .8,
+    fill = "grey", 
+    alpha = .3) +
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-28"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-05-18"))],
+    ymin = 0,
+    ymax = .8,
+    fill = "Red", 
+    alpha = .1) +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "6 months")+
+  geom_vline(xintercept=joyce_series$begin_date[joyce_series$year==2020 &                                            joyce_series$week==isoweek(date("2020-05-25"))], 
+              linetype="solid", color="blue", size=1)+
+  geom_label(aes(x=joyce_series$begin_date[joyce_series$year==2020 &
+                                             joyce_series$week==isoweek(date("2020-05-25"))],
+                 y=.8), 
+             label = "George Floyd", show.legend = FALSE)+
+  labs(title = "",
+       subtitle = "Age X Role",
+       x = "Week",
+       y = "",
+       fill = "MN COVID-19 Policy",
+       color = NULL,
+       caption = "")+
+  theme_classic()+
+    theme(axis.text.x=element_text(angle=45, hjust=1)) 
+
+
+```
+
+```{r weapon homicide plots, warning=FALSE}
+joyce_weapon_long <- joyce_series %>%
+  select(year, week, 
+         homicide_rate_firearm, 
+         homicide_rate_nonfirearm) %>%
+  pivot_longer(!c(year, week), 
+               names_to = "weapon", 
+               values_to = "homicide_rate") %>%
+  mutate(weapon = case_when(
+    weapon=="homicide_rate_firearm" ~ "Firearm",
+    weapon=="homicide_rate_nonfirearm" ~ "Other"),
+    begin_date = ISOweek2date(paste(year, 
+                                         paste0("W", 
+                                                sprintf("%02d", week)), 
+                                         1, 
+                                         sep = "-")),
+         end_date = begin_date+weeks(1)-days(1)) %>%
+  group_by(weapon) %>%
+  mutate(csma = forecast::ma(homicide_rate, order=5,centre=TRUE),
+         tsma = TTR::SMA(homicide_rate, n=5))
+
+
+ggplot(joyce_weapon_long)+
+  geom_line(aes(x=begin_date, y=homicide_rate))+ 
+  geom_line(aes(x=begin_date, y=tsma, color = "TSMA(5)"))+
+  facet_wrap(~weapon)+
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-13"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-12-27"))],
+    ymin = 0,
+    ymax = 9,
+    fill = "grey", 
+    alpha = .4) +
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-28"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-05-18"))],
+    ymin = 0,
+    ymax = 9,
+    fill = "Red", 
+    alpha = .4) +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "6 months")+
+  geom_vline(xintercept=joyce_series$begin_date[joyce_series$year==2020 &
+                joyce_series$week==isoweek(date("2020-05-25"))], 
+              linetype="solid", color="blue", size=1)+
+  geom_label(aes(x=joyce_series$begin_date[joyce_series$year==2020 &
+                   joyce_series$week==isoweek(date("2020-05-25"))],
+                 y=9), 
+             label = "George Floyd", show.legend = FALSE)+
+  labs(title = "Figure 4: Weekly Homicides in Hennepin & Ramsey Counties by Weapon, 2018-2022",
+       subtitle = "Violence Prevention Project Homicide Data",
+       x = "Week",
+       y = "Rate per 100,000 Residents",
+       fill = "MN COVID-19 Policy",
+       color = NULL,
+       caption = "The grey period represents the COVID-19 State of Emergency order, 
+       and the red represents the COVID-19 Stay at Home order.")+
+  theme_classic()+
+    theme(axis.text.x=element_text(angle=45, hjust=1)) 
+```
+
+```{r wespon plot 2}
+weapon_plot <- ggplot(joyce_weapon_long)+
+  #geom_line(aes(x=begin_date, y=homicide_rate, color = circumstance))+ 
+  geom_line(aes(x=begin_date, y=tsma, color = weapon))+
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-13"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-12-27"))],
+    ymin = 0,
+    ymax = 6,
+    fill = "grey", 
+    alpha = .3) +
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-28"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-05-18"))],
+    ymin = 0,
+    ymax = 6,
+    fill = "Red", 
+    alpha = .1) +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "6 months")+
+  geom_vline(xintercept=joyce_series$begin_date[joyce_series$year==2020 &                                            joyce_series$week==isoweek(date("2020-05-25"))], 
+              linetype="solid", color="blue", size=1)+
+  geom_label(aes(x=joyce_series$begin_date[joyce_series$year==2020 &
+                                             joyce_series$week==isoweek(date("2020-05-25"))],
+                 y=6), 
+             label = "George Floyd", show.legend = FALSE)+
+  labs(title = "",
+       subtitle = "Weapon",
+       x = "",
+       y = "",
+       fill = "MN COVID-19 Policy",
+       color = NULL,
+       caption = "Violence Prevention Project Homicide Data in Hennepin and Ramsey Counties, MN from 2018-2022. Each line represents the 5-week trailing series moving average. The grey period represents the COVID-19 State of Emergency order, and the red represents the COVID-19 Stay at Home order.")+
+  theme_classic()+
+    theme(axis.text.x=element_text(angle=45, hjust=1)) 
+
+```
+
+```{r combining plots}
+library(patchwork)
+
+circumstance_plot+age_role_plot+weapon_plot
+```
+
+```{r weaponXage homicide plots, warning=FALSE}
+joyce_weapon_age_long <- joyce_series %>%
+  select(year, week, 
+         homicide_rate_firearm_youth, 
+         homicide_rate_nonfirearm_youth,
+         homicide_rate_firearm_adult, 
+         homicide_rate_nonfirearm_adult) %>%
+  pivot_longer(!c(year, week), 
+               names_to = "weapon_age", 
+               values_to = "homicide_rate") %>%
+  mutate(weapon_age = case_when(
+    weapon_age=="homicide_rate_firearm_youth" ~ "Firearm Youth",
+    weapon_age=="homicide_rate_nonfirearm_youth" ~ "Other Youth",
+    weapon_age=="homicide_rate_firearm_adult" ~ "Firearm Adult",
+    weapon_age=="homicide_rate_nonfirearm_adult" ~ "Other Adult"),
+    begin_date = ISOweek2date(paste(year, 
+                                         paste0("W", 
+                                                sprintf("%02d", week)), 
+                                         1, 
+                                         sep = "-")),
+         end_date = begin_date+weeks(1)-days(1)) %>%
+  group_by(weapon_age) %>%
+  mutate(csma = forecast::ma(homicide_rate, order=5,centre=TRUE),
+         tsma = TTR::SMA(homicide_rate, n=5))
+
+
+ggplot(joyce_weapon_age_long)+
+  geom_line(aes(x=begin_date, y=homicide_rate))+ 
+  geom_line(aes(x=begin_date, y=tsma, color = "TSMA(5)"))+
+  facet_wrap(~weapon_age)+
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-13"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-12-27"))],
+    ymin = 0,
+    ymax = 20,
+    fill = "grey", 
+    alpha = .4) +
+  annotate(geom="rect",
+    xmin = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-03-28"))],
+    xmax = joyce_series$begin_date[joyce_series$year==2020 & joyce_series$week==isoweek(date("2020-05-18"))],
+    ymin = 0,
+    ymax = 20,
+    fill = "Red", 
+    alpha = .4) +
+  scale_x_date(date_labels = "%b-%Y", date_breaks = "6 months")+
+  geom_vline(xintercept=joyce_series$begin_date[joyce_series$year==2020 &
+                joyce_series$week==isoweek(date("2020-05-25"))], 
+              linetype="solid", color="blue", size=1)+
+  geom_label(aes(x=joyce_series$begin_date[joyce_series$year==2020 &
+                   joyce_series$week==isoweek(date("2020-05-25"))],
+                 y=20), 
+             label = "George Floyd", show.legend = FALSE)+
+  labs(title = "Figure 4: Weekly Homicides in Hennepin & Ramsey Counties by Weapon, 2018-2022",
+       subtitle = "Violence Prevention Project Homicide Data",
+       x = "Week",
+       y = "Rate per 1,000 Residents",
+       fill = "MN COVID-19 Policy",
+       color = NULL,
+       caption = "The grey period represents the COVID-19 State of Emergency order, 
+       and the red represents the COVID-19 Stay at Home order.")+
+  theme_classic()+
+    theme(axis.text.x=element_text(angle=45, hjust=1)) 
+```
+### Welch's T-Tests of Post-Floyd Effect (Two-Sample, Two-Sided)
+
+```{r}
+t.test(homicide_rate~post_floyd, data = joyce_series,
+       alternative = "two.sided", var.equal = FALSE)
+
+t.test(homicide_rate_argument~post_floyd, data = joyce_series,
+       alternative = "two.sided", var.equal = FALSE)
+
+t.test(homicide_rate_crime~post_floyd, data = joyce_series,
+       alternative = "two.sided", var.equal = FALSE)
+
+t.test(homicide_rate_domestic~post_floyd, data = joyce_series,
+       alternative = "two.sided", var.equal = FALSE)
+
+t.test(homicide_rate_adult_perp~post_floyd, data = joyce_series,
+       alternative = "two.sided", var.equal = FALSE)
+
+t.test(homicide_rate_adult_vic~post_floyd, data = joyce_series,
+       alternative = "two.sided", var.equal = FALSE)
+
+t.test(homicide_rate_youth_perp~post_floyd, data = joyce_series,
+       alternative = "two.sided", var.equal = FALSE)
+
+t.test(homicide_rate_youth_vic~post_floyd, data = joyce_series,
+       alternative = "two.sided", var.equal = FALSE)
+
+```
+
+### Interrupted Time Series Models
+
+$y_t =\beta_0+\beta_1 Time_t + \beta_2 PostMurder_t + \beta_3 TimePost_t+ \mathbf{\phi X}_t+\rho_1 y_{t-1}+\rho_2 y_{t-2}+\rho_3 y_{t-3}+\epsilon_t$
+
+#### Overall Model
+
+```{r time series models, message=F}
+#overall
+#initial its model
+
+ts_noc <- lm(homicide_rate~t+post_floyd+t_post_floyd+
+            dplyr::lag(homicide_rate, 1)+ 
+            dplyr::lag(homicide_rate, 2)+
+            dplyr::lag(homicide_rate, 3),
+           data = joyce_series)
+
+summary(ts_noc)
+
+ts_weather <- lm(homicide_rate~t+post_floyd+t_post_floyd+
+                       tmax_f+snow_in+precip_in+
+            dplyr::lag(homicide_rate, 1)+ 
+            dplyr::lag(homicide_rate, 2)+
+            dplyr::lag(homicide_rate, 3),
+           data = joyce_series) 
+
+summary(ts_weather)
+
+ts_policy <- lm(homicide_rate~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+
+            dplyr::lag(homicide_rate, 1)+ 
+            dplyr::lag(homicide_rate, 2)+
+            dplyr::lag(homicide_rate, 3),
+           data = joyce_series) 
+
+summary(ts_policy)
+
+
+# AR ITS model
+ts_ar3<- lm(homicide_rate~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+            covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+            dplyr::lag(homicide_rate, 1)+ 
+            dplyr::lag(homicide_rate, 2)+
+            dplyr::lag(homicide_rate, 3), 
+            data = joyce_series)
+summary(ts_ar3)
+
+acf2(resid(ts_ar3), max.lag = 7)
+
+#number of weeks post-treatment
+weeks_post <- sum(as.numeric(joyce_series$post_floyd)-1)
+
+#total homicides attributed to Floyd murder
+beta2 <- 0.28   # level change
+beta3 <- -0.003 # change in slope
+weeks <- 136    # number of weeks post-treatment
+t_post <- 1:weeks
+total_effect <- sum(beta2 + beta3 * t_post)
+total_effect*(1801894/100000)
+
+#total homicides
+sum(joyce_series$homicide)
+
+# total post-treatment homicides
+sum(joyce_series$homicide[joyce_series$post_floyd==1])
+total_effect*(1801894/100000)/sum(joyce_series$homicide[joyce_series$post_floyd==1])
+
+```
+
+```{r primary specifications, results='asis', message=FALSE, include = T}
+stargazer(ts_noc, ts_weather, ts_policy, ts_ar3,
+          title = "ITS Models of the Overall Homicide Rate, Hennepin/Ramsey Counties 2018-2022",
+          covariate.labels = c("Time",
+                               "Post-Murder", "T Post-Murder", 
+                               "COVID - State of Emerg.", "COVID - Stay at Home",
+                               "COVID - School Closure",
+                               "COVID - Business Closure", 
+                               "Mobility Pct. Change (Google)",
+                               "COVID Cases", "COVID Deaths",
+                               "Mean Max. Temp.", "Snow (in.)", "Precip. (in.)",
+                               "AR(1) - Overall Hom.", 
+                               "AR(2) - Overall Hom.", 
+                               "AR(3) - Overall Hom."),
+          dep.var.caption = "Weekly Homicides/100,000",
+          dep.var.labels = c("Base", 
+                             "Weather",
+                             "Policy",
+                             "Overall"),
+          dep.var.labels.include = TRUE,
+           report = "vcs",
+          ci=TRUE, 
+          ci.level=0.95, 
+          ci.separator = "|",
+          single.row = TRUE,
+          align = T,
+          omit.stat = c("adj.rsq", "f"),
+          font.size="footnotesize", no.space = T, column.sep.width = "1pt",
+          star.cutoffs = c(.05, .01, .001), star.char = c("*","**","***"),
+          header = F,
+          notes.append = F, 
+          type = "html",
+          out = "Joyce Homicide Project/Analysis Output/Table_1.html")
+```
+
+##### ITS Plot Overall
+
+```{r, message=FALSE, warning=FALSE}
+library(margins)
+
+mean_values <- summarise(joyce_series, 
+                         tmax_f = mean(tmax_f, na.rm = TRUE),
+                         snow_in = mean(snow_in, na.rm = TRUE),
+                         precip_in = mean(precip_in, na.rm = TRUE),
+                        avg_mobility = mean(avg_mobility, na.rm = T),
+                        covid_cases = mean(covid_cases, na.rm = T),
+                        covid_deaths = mean(covid_deaths, na.rm = T),
+                        homicide_rate = mean(homicide_rate, na.rm = T))
+
+pred_data <- joyce_series %>% 
+  select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd) %>% 
+  mutate(state_of_emerg = as.factor(0),
+         stay_at_home = as.factor(0),
+         school_closure = as.factor(0),
+         business_closure = as.factor(0),
+         tmax_f = mean_values$tmax_f,
+         snow_in = mean_values$snow_in,
+         precip_in = mean_values$precip_in,
+         avg_mobility = mean_values$avg_mobility,
+         covid_cases = mean_values$covid_cases,
+         covid_deaths = mean_values$covid_deaths,
+         homicide_rate = mean_values$homicide_rate)
+
+pred <- as.data.frame(margins(ts_ar3, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Overall") 
+
+overall_me <- ggplot(pred, aes(x = begin_date, color = Model)) +
+  geom_line(aes(y = fitted)) + 
+  geom_ribbon(aes(ymin = lower_ci, ymax = upper_ci, fill = Model), alpha = 0.1) + 
+  labs(title = "Figure 3: Marginal ITS Effect Plots of Homicide by Specification",
+       x = "Week",
+       y = "Homicide Rate/100,000",
+       subtitle = "Overall"
+       ) +
+  theme_minimal() +
+  geom_vline(xintercept = pred$begin_date[pred$year==2020 &
+                                            pred$week==isoweek(date("2020-05-25"))], 
+              linetype="dotted", color="blue", size=.5)
+```
+
+#### Age Stratified Models
+
+```{r}
+#victimization
+#youth
+#initial its model
+ts_yv <- lm(homicide_rate_youth_vic~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_yv)
+
+acf2(resid(ts_yv), max.lag = 7)
+
+# AR ITS model
+ts_ar1_yv<- lm(homicide_rate_youth_vic~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+            dplyr::lag(homicide_rate_youth_vic, 1), 
+            data = joyce_series)
+summary(ts_ar1_yv)
+
+acf2(resid(ts_ar1_yv), max.lag = 7)
+
+#adult
+#initial its model
+ts_av <- lm(homicide_rate_adult_vic~t+post_floyd+t_post_floyd+
+          state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+             covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_av)
+
+acf2(resid(ts_av), max.lag = 7)
+
+# AR ITS model
+ts_ar3_av<- lm(homicide_rate_adult_vic~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+            dplyr::lag(homicide_rate_adult_vic, 1)+
+            dplyr::lag(homicide_rate_adult_vic, 2)+
+            dplyr::lag(homicide_rate_adult_vic, 3), 
+            data = joyce_series)
+summary(ts_ar3_av)
+
+acf2(resid(ts_ar3_av), max.lag = 7)
+
+#perpetration
+#youth
+#initial its model
+ts_yp <- lm(homicide_rate_youth_perp~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_yp)
+
+acf2(resid(ts_yp), max.lag = 7)
+
+#adult
+#initial its model
+ts_ap <- lm(homicide_rate_adult_perp~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_ap)
+
+acf2(resid(ts_ap), max.lag = 7)
+
+# AR ITS model
+ts_ar3_ap <- lm(homicide_rate_adult_perp~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+            dplyr::lag(homicide_rate_adult_perp, 1)+
+            dplyr::lag(homicide_rate_adult_perp, 2)+
+            dplyr::lag(homicide_rate_adult_perp, 3), 
+            data = joyce_series)
+summary(ts_ar3_ap)
+
+acf2(resid(ts_ar3_ap), max.lag = 7)
+```
+
+```{r primary and age ts specifications, results='asis', message=FALSE, include = T}
+stargazer(ts_ar3, ts_ar1_yv, ts_ar3_av, ts_yp, ts_ar3_ap,
+          title = "ITS Models of Homicide Rate by Age and Role, Hennepin/Ramsey Counties 2018-2022",
+          covariate.labels = c("Time",
+                               "Post-Murder", "T Post-Murder",  
+                               "COVID - State of Emerg.", "COVID - Stay at Home",
+                               "COVID - School Closure",
+                               "COVID - Business Closure", "Mobility Pct. Change (Google)",
+                               "COVID Cases", "COVID Deaths",
+                               "Mean Max. Temp.", "Snow (in.)", "Precip. (in.)",
+                               "AR(1) - Overall Hom.", 
+                               "AR(2) - Overall Hom.", 
+                               "AR(3) - Overall Hom.",
+                               "AR(1) - Youth Victim",
+                               "AR(1) - Adult Victim", 
+                               "AR(2) - Adult Victim", 
+                               "AR(3) - Adult Victim",
+                               "AR(1) - Adult Perp.", 
+                               "AR(2) - Adult Perp.", 
+                               "AR(3) - Adult Perp."),
+          dep.var.caption = "Weekly Homicides/100,000",
+          dep.var.labels = c("Overall", 
+                             "Youth Victim", "Adult Victim", 
+                             "Youth Perp.", "Adult Perp."),
+          dep.var.labels.include = TRUE,
+          report = "vcs",
+          ci=TRUE, 
+          ci.level=0.95, 
+          ci.separator = "|",
+          single.row = TRUE,
+          align = T,
+          omit.stat = c("adj.rsq", "f"),
+          font.size="footnotesize", no.space = T, column.sep.width = "1pt",
+          star.cutoffs = c(.05, .01, .001), star.char = c("*","**","***"),
+          header = F,
+          notes.append = F, 
+          type = "html",
+          out = "Joyce Homicide Project/Analysis Output/Table_2.html")
+```
+
+```{r, message=FALSE, warning=FALSE}
+mean_values <- summarise(joyce_series, 
+                         tmax_f = mean(tmax_f, na.rm = TRUE),
+                         snow_in = mean(snow_in, na.rm = TRUE),
+                         precip_in = mean(precip_in, na.rm = TRUE),
+                        avg_mobility = mean(avg_mobility, na.rm = T),
+                        covid_cases = mean(covid_cases, na.rm = T),
+                        covid_deaths = mean(covid_deaths, na.rm = T),
+                        homicide_rate_youth_vic = mean(homicide_rate_youth_vic, na.rm = T),
+                       homicide_rate_youth_perp = mean(homicide_rate_youth_perp, na.rm = T),
+                       homicide_rate_adult_vic = mean(homicide_rate_adult_vic, na.rm = T),
+                       homicide_rate_adult_perp = mean(homicide_rate_adult_perp, na.rm = T))
+
+pred_data <- joyce_series %>% 
+  select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd) %>% 
+  mutate(state_of_emerg = as.factor(0),
+         stay_at_home = as.factor(0),
+         school_closure = as.factor(0),
+         business_closure = as.factor(0),
+         tmax_f = mean_values$tmax_f,
+         snow_in = mean_values$snow_in,
+         precip_in = mean_values$precip_in,
+         avg_mobility = mean_values$avg_mobility,
+         covid_cases = mean_values$covid_cases,
+         covid_deaths = mean_values$covid_deaths,
+         homicide_rate_youth_perp = mean_values$homicide_rate_youth_perp,
+         homicide_rate_youth_vic = mean_values$homicide_rate_youth_vic,
+         homicide_rate_adult_perp = mean_values$homicide_rate_adult_perp,
+         homicide_rate_adult_vic = mean_values$homicide_rate_adult_vic)
+
+pred_youth_vic <- as.data.frame(margins(ts_ar1_yv, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Youth Victim")
+
+pred_youth_perp <- as.data.frame(margins(ts_yp, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Youth Perp.")
+
+pred_adult_vic <- as.data.frame(margins(ts_ar3_av, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Adult Victim")
+
+pred_adult_perp <- as.data.frame(margins(ts_ar3_ap, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Adult Perp.")
+
+pred <- pred_youth_vic %>%
+  bind_rows(pred_youth_perp) %>%
+  bind_rows(pred_adult_vic) %>%
+  bind_rows(pred_adult_perp) %>%
+  mutate(model = "Age X Role")
+
+ageXrole_me <- ggplot(pred, aes(x = begin_date, color = Model)) +
+  geom_line(aes(y = fitted)) + 
+  geom_ribbon(aes(ymin = lower_ci, ymax = upper_ci, fill = Model), alpha = 0.1) + 
+  labs(title = "",
+       x = "Week",
+       y = "Homicide Rate/100,000",
+       subtitle = "Age X Role"
+       ) +
+  theme_minimal() +
+  geom_vline(xintercept = pred$begin_date[pred$year==2020 &
+                                            pred$week==isoweek(date("2020-05-25"))], 
+              linetype="dotted", color="blue", size=.5)
+
+```
+
+#### Circumstance Models
+
+```{r}
+#argument
+#initial its model
+ts_a <- lm(homicide_rate_argument~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_a)
+
+acf2(resid(ts_a), max.lag = 7)
+
+# AR ITS model
+ts_ar3_a<- lm(homicide_rate_argument~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+            dplyr::lag(homicide_rate_argument, 1)+ 
+            dplyr::lag(homicide_rate_argument, 2)+
+            dplyr::lag(homicide_rate_argument, 3), 
+            data = joyce_series)
+summary(ts_ar3_a)
+
+acf2(resid(ts_ar3), max.lag = 7)
+
+#felony crime related
+#initial its model
+ts_c <- lm(homicide_rate_crime~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_c)
+
+acf2(resid(ts_c), max.lag = 7)
+
+# AR ITS model
+ts_ar3_c<- lm(homicide_rate_crime~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+            dplyr::lag(homicide_rate_crime, 1)+ 
+            dplyr::lag(homicide_rate_crime, 2)+
+            dplyr::lag(homicide_rate_crime, 3), 
+            data = joyce_series)
+summary(ts_ar3_c)
+
+#domestic
+#initial its model
+ts_d <- lm(homicide_rate_domestic~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_d)
+
+acf2(resid(ts_d), max.lag = 7)
+
+#other homicides
+#initial its model
+ts_o <- lm(homicide_rate_other~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_o)
+
+acf2(resid(ts_o), max.lag = 7)
+```
+
+```{r overall and circumstance specifications, results='asis', message=FALSE, include = T}
+stargazer(ts_ar3, ts_ar3_a, ts_ar3_c, ts_d, ts_o,
+          title = "ITS Models of Homicide Rates by Circumstance, Hennepin/Ramsey Counties 2018-2022",
+          covariate.labels = c("Time",
+                               "Post-Murder", "T Post-Murder",  
+                               "COVID - State of Emerg.", "COVID - Stay at Home",
+                               "COVID - School Closure",
+                               "COVID - Business Closure", "Mobility Pct. Change (Google)",
+                               "COVID Cases", "COVID Deaths",
+                               "Mean Max. Temp.", "Snow (in.)", "Precip. (in.)",
+                               "AR(1) - Overall Hom.", 
+                               "AR(2) - Overall Hom.", 
+                               "AR(3) - Overall Hom.",
+                               "AR(1) - Argument", 
+                               "AR(2) - Argument", 
+                               "AR(3) - Argument",
+                               "AR(1) - Fel. Crime", 
+                               "AR(2) - Fel. Crime", 
+                               "AR(3) - Fel. Crime"),
+          dep.var.caption = "Weekly Homicides/100,000",
+          dep.var.labels = c("Overall", 
+                             "Argument",
+                             "Fel. Crime", 
+                             "Domestic",
+                             "Other"),
+          dep.var.labels.include = TRUE,
+           report = "vcs",
+          ci=TRUE, 
+          ci.level=0.95, 
+          ci.separator = "|",
+          single.row = TRUE,
+          align = T,
+          omit.stat = c("adj.rsq", "f"),
+          font.size="footnotesize", no.space = T, column.sep.width = "1pt",
+          star.cutoffs = c(.05, .01, .001), star.char = c("*","**","***"),
+          header = F,
+          notes.append = F, 
+          type = "html",
+          out = "Joyce Homicide Project/Analysis Output/Table_3.html")
+```
+
+```{r, message=FALSE, warning=FALSE}
+mean_values <- summarise(joyce_series, 
+                         tmax_f = mean(tmax_f, na.rm = TRUE),
+                         snow_in = mean(snow_in, na.rm = TRUE),
+                         precip_in = mean(precip_in, na.rm = TRUE),
+                        avg_mobility = mean(avg_mobility, na.rm = T),
+                        covid_cases = mean(covid_cases, na.rm = T),
+                        covid_deaths = mean(covid_deaths, na.rm = T),
+                        homicide_rate_other = mean(homicide_rate_other, na.rm = T),
+                       homicide_rate_domestic = mean(homicide_rate_domestic, na.rm = T),
+                       homicide_rate_crime = mean(homicide_rate_crime, na.rm = T),
+                       homicide_rate_argument = mean(homicide_rate_argument, na.rm = T))
+
+pred_data <- joyce_series %>% 
+  select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd) %>% 
+  mutate(state_of_emerg = as.factor(0),
+         stay_at_home = as.factor(0),
+         school_closure = as.factor(0),
+         business_closure = as.factor(0),
+         tmax_f = mean_values$tmax_f,
+         snow_in = mean_values$snow_in,
+         precip_in = mean_values$precip_in,
+         avg_mobility = mean_values$avg_mobility,
+         covid_cases = mean_values$covid_cases,
+         covid_deaths = mean_values$covid_deaths,
+         homicide_rate_argument = mean_values$homicide_rate_argument,
+         homicide_rate_crime = mean_values$homicide_rate_crime,
+         homicide_rate_domestic = mean_values$homicide_rate_domestic,
+         homicide_rate_other = mean_values$homicide_rate_other)
+
+pred_argument <- as.data.frame(margins(ts_ar3_a, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Argument")
+
+pred_crime <- as.data.frame(margins(ts_c, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Fel. Crime")
+
+pred_domestic <- as.data.frame(margins(ts_d, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Domestic")
+
+pred_other <- as.data.frame(margins(ts_o, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Other")
+
+pred <- pred_argument %>%
+  bind_rows(pred_crime) %>%
+  bind_rows(pred_domestic) %>%
+  bind_rows(pred_other) %>%
+  mutate(model = "Circumstance")
+
+
+
+
+
+circumstance_me <- ggplot(pred, aes(x = begin_date, color = Model)) +
+  geom_line(aes(y = fitted)) + 
+  geom_ribbon(aes(ymin = lower_ci, ymax = upper_ci, fill = Model), alpha = 0.1) + 
+  labs(title = "",
+       x = "Week",
+       y = "Homicide Rate/100,000",
+       subtitle = "Circumstance"
+       ) +
+  theme_minimal() +
+  geom_vline(xintercept = pred$begin_date[pred$year==2020 &
+                                            pred$week==isoweek(date("2020-05-25"))], 
+              linetype="dotted", color="blue", size=.5)
+
+```
+
+#### Weapon Models
+
+```{r}
+#firearm
+#initial its model
+ts_fire <- lm(homicide_rate_firearm~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_fire)
+
+acf2(resid(ts_fire), max.lag = 7)
+
+# AR ITS model
+ts_ar3_fire<- lm(homicide_rate_firearm~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+            dplyr::lag(homicide_rate_firearm, 1)+ 
+            dplyr::lag(homicide_rate_firearm, 2)+
+            dplyr::lag(homicide_rate_firearm, 3)+
+            dplyr::lag(homicide_rate_firearm, 4)+
+            dplyr::lag(homicide_rate_firearm, 5), 
+            data = joyce_series)
+summary(ts_ar3_fire)
+
+acf2(resid(ts_ar3_fire), max.lag = 7)
+
+#nonfirearm
+#initial its model
+ts_nf <- lm(homicide_rate_nonfirearm~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in,
+           data = joyce_series) 
+summary(ts_nf)
+
+acf2(resid(ts_nf), max.lag = 7)
+
+# AR ITS model
+ts_ar3_nf<- lm(homicide_rate_nonfirearm~t+post_floyd+t_post_floyd+
+           state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+              covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+            dplyr::lag(homicide_rate_nonfirearm, 1)+ 
+            dplyr::lag(homicide_rate_nonfirearm, 2)+
+            dplyr::lag(homicide_rate_nonfirearm, 3), 
+            data = joyce_series)
+summary(ts_ar3_nf)
+```
+
+```{r overall weapon specifications, results='asis', message=FALSE, include = T}
+stargazer(ts_ar3, ts_ar3_fire, ts_ar3_nf, 
+          title = "ITS Models of Homicide Rates by Weapon, Hennepin/Ramsey Counties 2018-2022",
+          covariate.labels = c("Time",
+                               "Post-Murder", "T Post-Murder",  
+                               "COVID - State of Emerg.", "COVID - Stay at Home",
+                               "COVID - School Closure",
+                               "COVID - Business Closure", "Mobility Pct. Change (Google)",
+                               "COVID Cases", "COVID Deaths",
+                               "Mean Max. Temp.", "Snow (in.)", "Precip. (in.)",
+                               "AR(1) - Overall Hom.", 
+                               "AR(2) - Overall Hom.", 
+                               "AR(3) - Overall Hom.",
+                               "AR(1) - Firearm", 
+                               "AR(2) - Firearm", 
+                               "AR(3) - Firearm",
+                               "AR(4) - Firearm", 
+                               "AR(5) - Firearm",
+                               "AR(1) - Other", 
+                               "AR(2) - Other", 
+                               "AR(3) - Other"),
+          dep.var.caption = "Weekly Homicides/100,000",
+          dep.var.labels = c("Overall", 
+                             "Firearm", 
+                             "Other"),
+          dep.var.labels.include = TRUE,
+           report = "vcs",
+          ci=TRUE, 
+          ci.level=0.95, 
+          ci.separator = "|",
+          single.row = TRUE,
+          align = T,
+          omit.stat = c("adj.rsq", "f"),
+          font.size="footnotesize", no.space = T, column.sep.width = "1pt",
+          star.cutoffs = c(.05, .01, .001), star.char = c("*","**","***"),
+          header = F,
+          notes.append = F, 
+          type = "html",
+          out = "Joyce Homicide Project/Analysis Output/Table_4.html")
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+mean_values <- summarise(joyce_series, 
+                         tmax_f = mean(tmax_f, na.rm = TRUE),
+                         snow_in = mean(snow_in, na.rm = TRUE),
+                         precip_in = mean(precip_in, na.rm = TRUE),
+                        avg_mobility = mean(avg_mobility, na.rm = T),
+                        covid_cases = mean(covid_cases, na.rm = T),
+                        covid_deaths = mean(covid_deaths, na.rm = T),
+                        homicide_rate_firearm = mean(homicide_rate_firearm, na.rm = T),
+                       homicide_rate_nonfirearm = mean(homicide_rate_nonfirearm, na.rm = T))
+
+pred_data <- joyce_series %>% 
+  select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd) %>% 
+  mutate(state_of_emerg = as.factor(0),
+         stay_at_home = as.factor(0),
+         school_closure = as.factor(0),
+         business_closure = as.factor(0),
+         tmax_f = mean_values$tmax_f,
+         snow_in = mean_values$snow_in,
+         precip_in = mean_values$precip_in,
+         avg_mobility = mean_values$avg_mobility,
+         covid_cases = mean_values$covid_cases,
+         covid_deaths = mean_values$covid_deaths,
+         homicide_rate_firearm = mean_values$homicide_rate_firearm,
+         homicide_rate_nonfirearm = mean_values$homicide_rate_nonfirearm)
+
+pred_firearm <- as.data.frame(margins(ts_ar3_fire, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Firearm")
+
+pred_other <- as.data.frame(margins(ts_ar3_nf, 
+                                    variables = c("t", "post_floyd", "t_post_floyd"),
+                                    data = pred_data)) %>%
+   select(year, week, begin_date, 
+          t, post_floyd, t_post_floyd,
+          fitted, se.fitted) %>%
+  mutate(upper_ci = fitted+1.96*se.fitted,
+         lower_ci = fitted-1.96*se.fitted,
+         Model = "Other")
+
+
+
+pred <- pred_firearm %>%
+  bind_rows(pred_other) %>%
+  mutate(model = "Weapon")
+
+weapon_me <- ggplot(pred, aes(x = begin_date, color = Model)) +
+  geom_line(aes(y = fitted)) + 
+  geom_ribbon(aes(ymin = lower_ci, ymax = upper_ci, fill = Model), alpha = 0.1) + #toy around with alpha parameter
+  labs(title = "",
+       x = "Week",
+       y = "Homicide Rate/100,000",
+       subtitle = "Weapon"
+       ) +
+  theme_minimal() +
+  geom_vline(xintercept = pred$begin_date[pred$year==2020 &
+                                            pred$week==isoweek(date("2020-05-25"))], 
+              linetype="dotted", color="blue", size=.5)
+
+```
+
+#### Combined ITS Plot for Publication
+
+```{r, warning=FALSE}
+(overall_me+circumstance_me)/(ageXrole_me+weapon_me)
+```
+
+# ITS Panel Analysis
+
+## Panel Data Expansions
+
+### Space-Static, TV Covariates from TS Build
+
+```{r}
+joyce_panel <- joyce_panel %>%
+  left_join(weather, by = c("year","week")) %>%
+  left_join(covid_hr, by = c("year", "week")) %>%
+  left_join(google_mobility_series, by = c("year", "week"))
+```
+
+### Bookends and DV Measures
+
+```{r}
+joyce_panel <- joyce_panel %>%
+  mutate(homicide_rate = (homicide/total_pop)*100000,
+         homicide_rate_adult_vic = (adult_homicide_vic/pop_above_18)*100000,
+         homicide_rate_youth_vic = (youth_homicide_vic/pop_below_18)*100000,
+         homicide_rate_adult_perp = (adult_homicide_perp/pop_above_18)*100000,
+         homicide_rate_youth_perp = (youth_homicide_perp/pop_below_18)*100000,
+         homicide_rate_argument = (homicide_argument/total_pop)*100000,
+         homicide_rate_crime = (homicide_crime/total_pop)*100000,
+         homicide_rate_domestic = (homicide_domestic/total_pop)*100000,
+         homicide_rate_other = (homicide_other/total_pop)*100000) %>%
+  mutate(begin_date = ISOweek2date(paste(year, 
+                                         paste0("W", 
+                                                sprintf("%02d", week)), 
+                                         1, 
+                                         sep = "-")),
+         end_date = begin_date+weeks(1)-days(1)) %>%
+  mutate(across(-c(geometry, begin_date, end_date, GEOID), 
+                ~ ifelse(GEOID %in% c(27053980000, 27123980000), NA, .))) #airport and pig's eye lake 
+```
+
+### ITS Time Structure
+
+```{r}
+joyce_panel <- joyce_panel %>%
+  mutate(t = 1:length(homicide_rate),
+         post_floyd = as.factor(as.numeric(begin_date >= as.Date("2020-05-25"))),
+         post_floyd_3 = as.factor(as.numeric(begin_date >= as.Date("2020-05-25") + 
+                                               months(3))),
+         weeks_post = as.numeric(begin_date-as.Date("2020-05-25"))/7,
+         t_post_floyd = ifelse(weeks_post >=0,
+                               weeks_post,
+                               0),
+         period = factor(case_when(
+           post_floyd==0 & post_floyd_3==0 ~ "Pre-Murder",
+           post_floyd==1 & post_floyd_3==0 ~ "0-3 Months Post-Murder",
+           post_floyd==1 & post_floyd_3==1 ~ "3+ Months Post-Murder"),
+           levels = c("Pre-Murder", "0-3 Months Post-Murder", "3+ Months Post-Murder")))
+```
+
+### COVID Time Parameterizations
+
+```{r}
+joyce_panel <- joyce_panel %>%
+  mutate(stay_at_home = as.factor(as.numeric(begin_date >= as.Date("2020-03-28") &                                                  begin_date <= as.Date("2020-05-28"))),
+         state_of_emerg = as.factor(as.numeric(begin_date >= as.Date("2020-03-13") &
+                                               begin_date <= as.Date("2021-07-1"))),
+         genpub_vaxx = as.factor(as.numeric(begin_date >= as.Date("2021-03-30"))),
+         school_closure = as.factor(as.numeric(begin_date >= as.Date("2020-03-18") &
+                                               begin_date <= as.Date("2021-02-22"))),
+         bar_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-10")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2021-01-11")))),
+         gym_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-10")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2020-12-18")))),
+         movie_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-10")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2021-01-11")))),
+         restaurant_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-01")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2021-01-11")))),
+         business_closure = as.factor(as.numeric((begin_date >= as.Date("2020-03-17") &
+                                            begin_date <= as.Date("2020-06-10")) |
+                                            (begin_date >= as.Date("2020-11-21") &
+                                             begin_date <= as.Date("2021-01-11")))))
+```
+
+## Tract-Level Map
+
+### Aggregating to Neighborhood-Period Level
+
+```{r}
+length(unique(joyce_panel$GEOID))*3 #1416 tract-periods
+
+homicide_tract_period <- joyce_panel %>%
+  group_by(GEOID, period) %>%
+  summarize(homicide = sum(homicide, na.rm = T),
+            adult_homicide_vic = sum(adult_homicide_vic, na.rm = T),
+            youth_homicide_vic = sum(youth_homicide_vic, na.rm = T),
+            adult_homicide_perp = sum(adult_homicide_perp, na.rm = T),
+            youth_homicide_perp = sum(youth_homicide_perp, na.rm = T),
+            homicide_argument = sum(homicide_argument, na.rm = T),
+            homicide_crime = sum(homicide_crime, na.rm = T),
+            homicide_domestic = sum(homicide_domestic, na.rm = T),
+            homicide_other = sum(homicide_other, na.rm = T),
+            total_pop = sum(total_pop, na.rm = T),
+            pop_below_18 = sum(pop_below_18, na.rm = T),
+            pop_above_18 = sum(pop_above_18, na.rm = T)) %>%
+  mutate(homicide_rate = (homicide/total_pop)*100000,
+         homicide_rate_adult_vic = (adult_homicide_vic/pop_above_18)*100000,
+         homicide_rate_youth_vic = (youth_homicide_vic/pop_below_18)*100000,
+         homicide_rate_adult_perp = (adult_homicide_perp/pop_above_18)*100000,
+         homicide_rate_youth_perp = (youth_homicide_perp/pop_below_18)*100000,
+         homicide_rate_argument = (homicide_argument/total_pop)*100000,
+         homicide_rate_crime = (homicide_crime/total_pop)*100000,
+         homicide_rate_domestic = (homicide_domestic/total_pop)*100000,
+         homicide_rate_other = (homicide_other/total_pop)*100000) %>%
+  mutate(across(-c(geometry, period), 
+                ~ ifelse(GEOID %in% c(27053980000, 27123980000), NA, .))) #airport and pig's eye lake 
+
+```
+
+### Tract-Period Maps
+
+```{r}
+ggplot() +
+  geom_sf(data = homicide_tract_period, aes(geometry = geometry, fill = homicide_rate)) + 
+  geom_sf(data = mpls_stp, aes(geometry = geometry), color = "black", alpha = 0)+
+  facet_grid(~period)+
+  scale_fill_distiller(palette = "Spectral")+
+  labs(title = "Figure S1: Homicide Rates by Census Tract and Period", 
+       subtitle = "Overall Homicide Rates",
+       fill = "Weekly Rate/100,000")+
+  theme_void()+
+  theme(legend.position="bottom")
+
+range(homicide_tract_period$homicide_rate[homicide_tract_period$period=="Pre-Murder"], na.rm = T)
+mean(homicide_tract_period$homicide_rate[homicide_tract_period$period=="Pre-Murder"], na.rm = T)
+sd(homicide_tract_period$homicide_rate[homicide_tract_period$period=="Pre-Murder"], na.rm = T)
+
+range(homicide_tract_period$homicide_rate[homicide_tract_period$period=="0-3 Months Post-Murder"], na.rm = T)
+mean(homicide_tract_period$homicide_rate[homicide_tract_period$period=="0-3 Months Post-Murder"], na.rm = T)
+sd(homicide_tract_period$homicide_rate[homicide_tract_period$period=="0-3 Months Post-Murder"], na.rm = T)
+
+range(homicide_tract_period$homicide_rate[homicide_tract_period$period=="3+ Months Post-Murder"], na.rm = T)
+mean(homicide_tract_period$homicide_rate[homicide_tract_period$period=="3+ Months Post-Murder"], na.rm = T)
+sd(homicide_tract_period$homicide_rate[homicide_tract_period$period=="3+ Months Post-Murder"], na.rm = T)
+
+```
+
+### CFA of Concentrated Disadvantage
+
+```{r cfa model}
+#dropping two missing data tracts with no residents after mapping
+joyce_panel <- joyce_panel %>%
+  filter(!GEOID %in% c(27053980000, 27123980000))
+
+
+library(lavaan)
+
+cd_model_1  <- ' cd =~ unemp_rate + pov_rate +  female_hh_rate + no_hs_dip_rate 
+                  unemp_rate ~~ pov_rate'  
+
+cfa_cd <- cfa(cd_model_1, data = joyce_panel, std.lv = T)
+modificationindices(cfa_cd)
+summary(cfa_cd, fit.measures=TRUE, standardized = T)
+cd_predict <- as.vector(lavPredict(cfa_cd, newdata = as.data.frame(joyce_panel)))
+joyce_panel$conc_dis <- cd_predict
+```
+
+```{r cfa model table, results='asis'}
+results_table<-standardizedSolution(cfa_cd) %>% 
+  filter(row_number() %in% c(1:5)) %>% 
+  dplyr::select(LHS=lhs, Specification=op, RHS=rhs, 'Std(Beta)'=est.std, SE=se, 
+                'P-Value'=pvalue) %>%
+  mutate(LHS = case_when(
+    LHS=="cd"~"Conc. Dis.",
+    LHS=="unemp_rate"~"Unemp. Rate"),  
+         RHS = case_when(
+           RHS=="unemp_rate"~"Unemp. Rate",
+           RHS=="pov_rate"~"Poverty Rate",
+           RHS=="female_hh_rate"~"Female-HH Rate",
+           RHS=="no_hs_dip_rate"~"No HS Diploma Rate",
+         ),
+    Specification = case_when(
+      Specification=="=~"~"FL",
+      Specification=="~~"~"Cov."),
+     `P-Value` = round(`P-Value`, 2)) 
+    
+
+
+stargazer(results_table, summary = FALSE, header = F,
+           type="html", style="aer", align = T, 
+           title="CFA Measurement Model of Concentrated Disadvantage", 
+           notes="$LR\\chi^2$ vs. saturated (6) = 165410, p < .05,  CFI = 1.00, SRMR = .002")
+```
+
+## RE ITS Panel Models
+
+$y_{ti} =\beta_{0i}+\beta_1 Time_t + \theta_i Event_t + \beta_2 TimePost_t+ \mathbf{\phi X}_{ti}+\rho_1 y_{t-1}+\rho_2 y_{t-2}+\rho_3 y_{t-3}+\epsilon_{ti}$
+
+$\beta_{0i} = \gamma_{00}+u_{0i}$
+
+$\theta_{i} = \gamma_{10}+u_{i}$
+
+```{r, message=FALSE, warning=FALSE}
+library(lme4)
+library(lmerTest)
+
+#RE random coefficient model
+re <- lmer(homicide_rate~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+            covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+             conc_dis+
+            dplyr::lag(homicide_rate, 1)+ 
+            dplyr::lag(homicide_rate, 2)+
+            dplyr::lag(homicide_rate, 3)+
+             (post_floyd|GEOID), 
+            data = joyce_panel)
+summary(re)
+
+joyce_panel <- joyce_panel %>%
+  mutate(hr_lag_1 = dplyr::lag(homicide_rate, 1),
+         hr_lag_2 = dplyr::lag(homicide_rate, 2),
+         hr_lag_3 = dplyr::lag(homicide_rate, 3))
+
+re_int <- lmer(homicide_rate~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+            covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+             conc_dis*post_floyd+
+            dplyr::lag(homicide_rate, 1)+ 
+            dplyr::lag(homicide_rate, 2)+
+            dplyr::lag(homicide_rate, 3)+
+             (post_floyd|GEOID), 
+            data = joyce_panel)
+summary(re_int)
+
+re_int <- lmer(homicide_rate~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+            covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+             conc_dis*post_floyd+
+             (post_floyd|GEOID), 
+            data = joyce_panel)
+
+#specifying varcov objects from model estimates
+
+var_re <- VarCorr(re)
+var_re_int <- VarCorr(re_int)
+class(re) <- "lmerMod" 
+class(re_int) <- "lmerMod" 
+```
+
+```{r primary re models, results='asis', message=FALSE, include = T}
+stargazer(re, re_int,
+          title = "RE ITS Panel Models of the Homicide Rate, Hennepin/Ramsey Counties 2018-2022",
+          covariate.labels = c("Time",
+                               "Post-Murder", "T Post-Murder", 
+                               "COVID - State of Emerg.", "COVID - Stay at Home",
+                               "COVID - School Closure",
+                               "COVID - Business Closure", 
+                               "Mobility Pct. Change (Google)",
+                               "COVID Cases", "COVID Deaths",
+                               "Mean Max. Temp.", "Snow (in.)", "Precip. (in.)",
+                               "Conc. Dis. (Std.)",
+                               "AR(1) - Overall Hom.", 
+                               "AR(2) - Overall Hom.", 
+                               "AR(3) - Overall Hom.",
+                               "Conc. Dis. X Post-Murder"),
+          dep.var.caption = "Homicides/100,000",
+          column.labels = c("Base", "Interaction"),
+          dep.var.labels.include = FALSE,
+           report = "vcs",
+          ci=TRUE, 
+          ci.level=0.95, 
+          ci.separator = "|",
+          single.row = TRUE,
+          align = T,
+          omit.stat = c("adj.rsq", "f"),
+          font.size="footnotesize", no.space = T, column.sep.width = "1pt",
+          star.cutoffs = c(.05, .01, .001), star.char = c("*","**","***"),
+          header = F,
+          notes.append = F, 
+          type = "html",
+          add.lines = list(c("Resid. Var.", 
+                             round(attr(VarCorr(re), "sc")^2,2),
+                             round(attr(VarCorr(re_int), "sc")^2,2)), 
+                            c("Tract Var.", 
+                             round(var_re$GEOID[1,1],2),
+                             round(var_re_int$GEOID[1,1],2)),
+                             c("Post-Floyd Var.", 
+                                        round(var_re$GEOID[2,2],2),
+                                        round(var_re_int$GEOID[2,2],2))),
+                    out = "Joyce Homicide Project/Analysis Output/Table_6.html")
+
+```
+
+### Random Coefficient Map
+
+```{r}
+re_coefs <- as.data.frame(coef(re)$GEOID) %>%
+  dplyr::select(post_floyd1) %>%
+  mutate(GEOID = as.character(rownames(.))) %>%
+  rename(post_floyd1 = post_floyd1)
+
+#aggregate to tract-level over years
+tract_level <- joyce_panel %>%
+  group_by(GEOID) %>%
+   summarize(conc_dis = mean(conc_dis, na.rm = T)) %>%
+  ungroup() %>%
+  st_drop_geometry()
+
+tract_level_geo <- hr_tracts %>%
+  left_join(tract_level, by = "GEOID") %>%
+  left_join(re_coefs, by = "GEOID")
+  
+
+
+re_coef_map <- ggplot() +
+  geom_sf(data = tract_level_geo, aes(geometry = geometry, fill = post_floyd1), 
+          color = "lightgrey") + 
+  geom_sf(data = mpls_stp, aes(geometry = geometry), color = "black", alpha = 0)+
+  scale_fill_distiller(palette = "Spectral",
+                       limits = c(min(tract_level_geo$post_floyd1),
+                                  max(tract_level_geo$post_floyd1)))+
+  labs(title = "Figure 4: Spatial Heterogeneity of Post-Murder Effect",
+       subtitle = "Post-Murder Random Coefficients",
+       fill = "Post-Killing Change")+
+  theme_void()+
+  theme(legend.position="bottom")
+```
+
+### Interaction Plot
+
+```{r, warning=FALSE}
+library(ggeffects)
+
+re_int <- lmer(homicide_rate~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+            covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+             conc_dis*post_floyd+
+           hr_lag_1+hr_lag_2+hr_lag_3+ 
+             (post_floyd|GEOID), 
+            data = joyce_panel)
+
+preds <- ggpredict(re_int, 
+                  terms = c("post_floyd", "conc_dis [-2, -1, 0, 1, 2]"),
+                  na.omit = TRUE) 
+#relabel
+preds$group <- factor(preds$group, 
+                      levels = c(2, 1, 0, -1, -2),  
+                      labels = c("+2 SD", "+1 SD", "Mean", "-1 SD", "-2 SD"))
+
+
+
+int_plot <- ggplot(preds, aes(x = x, y = predicted, color = group)) +
+  geom_point(size = 1.2) +  
+  geom_line(aes(group = group), size = .5)+
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.09) +
+  scale_color_brewer(palette = "Spectral")+
+  labs(
+    x = "Post-Murder",
+    y = "Predicted Tract-Level Homicide Rate",
+    subtitle = "Post-Murder X CD Interaction Effect",
+    color = "CD"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+re_coef_map+int_plot
+```
+
+# Minneapolis/St. Paul Sub-Analysis
+
+## Minneapolis/St. Paul Panel
+
+```{r, message=FALSE}
+joyce_panel_msp <- joyce_panel %>%
+  st_filter(mpls_stp, .predicate = st_within)
+```
+
+## MPD Police Indicators
+
+
+```{r, message=FALSE}
+mpd_stops <- read_csv("Data/Police_Stop_Data.csv") %>%
+  mutate(date=ymd_hms(responseDate),
+         year=isoyear(date),
+         week=isoweek(date)) %>%
+  filter(year>=2018 & year <=2022) %>% 
+  dplyr::select(OBJECTID, year, week, long, lat) %>%
+  st_as_sf(coords = c("long", "lat"), crs = "NAD83", remove=F) %>%
+  st_join(msp_tracts) %>% #spatial join neighborhoods
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID)) %>%
+  group_by(year, week, GEOID, .drop=F) %>%
+  tally(name = "mpd_stops") %>%
+  ungroup() %>%
+  complete(year, week, GEOID=msp_tracts$GEOID, fill = list(mpd_stops = 0)) %>%
+  filter(!(year==2021 & week==53)) %>% 
+  arrange(GEOID, year, week) %>%
+  mutate(GEOID = as.character(GEOID)) 
+```
+
+## STP Police Indicators
+
+```{r, message=FALSE, eval=FALSE}
+stp_stops <- read_csv("Data/Saint_Paul_Police_Department_Traffic_Stops.csv") 
+
+#no day field!
+
+#could try tract-month within STP or MSP
+```
+
+
+### RE ITS Models with Traffic Stops
+
+```{r, message=FALSE}
+#filtering to just MPLS for now
+joyce_panel_mpls <- joyce_panel_msp %>%
+  st_filter(mpls, .predicate = st_within) 
+
+joyce_panel_mpls <- joyce_panel_mpls %>%
+  left_join(mpd_stops, by = c("GEOID", "year", "week")) %>%
+  mutate(mpd_stop_rate = mpd_stops/total_pop*100000) %>%
+  mutate(weight = case_when(
+           year==2018~0.8,
+           year==2019~1.2, #can change weights here
+           year==2020~1,
+           year==2021~1,
+           year==2022~1
+         )) %>%
+  arrange(GEOID, year, week) %>%
+  group_by(GEOID, week) %>%
+  mutate(
+    stop_weight_1819 = sum(if_else(year < 2020, mpd_stops * weight, NA_real_), 
+                           na.rm = TRUE),
+    denom_1819 = sum(if_else(year < 2020, weight, NA_real_), na.rm = TRUE),
+    week_wgt_avg_1819 = stop_weight_1819 / denom_1819) %>%
+   group_by(GEOID) %>%
+    mutate(stop_wt_1819_3wk = (week_wgt_avg_1819  + 
+                       lag(week_wgt_avg_1819 , 1) + 
+                       lag(week_wgt_avg_1819 , 2))/ 3,
+           stop_wt_1819_3wk = zoo::na.locf(stop_wt_1819_3wk, fromLast=T)) %>%
+  mutate(cf_obs_stop = if_else(year >= 2020, 
+                                    (mpd_stops  + 
+                                      lag(mpd_stops , 1) + 
+                                       lag(mpd_stops , 2))/ 3,
+                                    stop_wt_1819_3wk)) %>%
+  group_by(GEOID) %>%
+  mutate(stop_wt_3wk_dev = cf_obs_stop - stop_wt_1819_3wk)
+
+#stop_wt_3wk_dev = temporal deviations of stop moving averages from SAME WEEK pre-treatment weighted rolling average in 2018-2019
+  #1) tempers fluctuations in MPD
+  #2) upweight more recent comparisons
+  #3) creates baseline of consistent activity with weekly rhythms
+  #4) counterfactual impervious to simultaneity
+      # crime in 2020 can't cause policing in 18-19, therefore deviations have to be driven by LHS, breaks the backwards causal path
+
+re <- lmer(homicide_rate~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+            covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+             conc_dis+
+            dplyr::lag(homicide_rate, 1)+ 
+            dplyr::lag(homicide_rate, 2)+
+            dplyr::lag(homicide_rate, 3)+
+             (post_floyd|GEOID), 
+            data = joyce_panel_mpls)
+summary(re)
+
+re_mpd <- lmer(homicide_rate~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+            covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+             conc_dis+
+             stop_wt_3wk_dev+
+            dplyr::lag(homicide_rate, 1)+ 
+            dplyr::lag(homicide_rate, 2)+
+            dplyr::lag(homicide_rate, 3)+
+             (post_floyd|GEOID), 
+            data = joyce_panel_mpls)
+summary(re_mpd)
+```
+
+### Causal Mediation Analysis
+
+```{r, warning=FALSE, message=FALSE}
+library(mediation)
+detach("package:lmerTest", unload = T)
+
+#must make lags explicit on data frame for mediate
+joyce_panel_mpls <- joyce_panel_mpls %>%
+  group_by(GEOID) %>%
+  mutate(
+    lag_homicide_rate_1 = lag(homicide_rate, 1),
+    lag_homicide_rate_2 = lag(homicide_rate, 2),
+    lag_homicide_rate_3 = lag(homicide_rate, 3)
+  )
+
+# Step 1: Fit the Mediator Model
+mediator_model <- lmer(stop_wt_3wk_dev~t+post_floyd+t_post_floyd+
+            state_of_emerg+stay_at_home+
+           school_closure+business_closure+avg_mobility+
+            covid_cases+covid_deaths+
+           tmax_f+snow_in+precip_in+
+             conc_dis+
+            lag_homicide_rate_1 + 
+            lag_homicide_rate_2 +
+            lag_homicide_rate_3 +
+             (1|GEOID), 
+            data = joyce_panel_mpls)
+
+# Step 2: Fit the Outcome Model
+
+outcome_model <- lmer(homicide_rate ~ t + post_floyd + t_post_floyd +
+                      state_of_emerg + stay_at_home +
+                      school_closure + business_closure + avg_mobility +
+                      covid_cases + covid_deaths +
+                      tmax_f + snow_in + precip_in +
+                        conc_dis+
+                      stop_wt_3wk_dev+ 
+                      lag_homicide_rate_1+
+                       lag_homicide_rate_2+
+                       lag_homicide_rate_3+
+             (1|GEOID), 
+                    data = joyce_panel_mpls)
+
+# Step 3: Conduct Mediation Analysis
+# Set up the mediation analysis with `mediate()`
+mediation_analysis <- mediate(mediator_model, outcome_model, 
+                              treat = "post_floyd", mediator = "stop_wt_3wk_dev", 
+                              boot = F, sims = 1000)
+
+# Step 4: Summarize the Mediation Analysis
+summary(mediation_analysis)
+
+sum_med <- summary(mediation_analysis)
+
+med_data <- data.frame(
+  effect = c("ACME (control)", "ACME", "ADE (control)", "ADE", "Total Effect", "Prop. Mediated"),
+  estimate = c(sum_med$d0, sum_med$d1, sum_med$z0, sum_med$z1, sum_med$tau.coef, sum_med$n0),
+  lower_ci = c(sum_med$d0.ci[1], sum_med$d1.ci[1], sum_med$z0.ci[1], sum_med$z1.ci[1], sum_med$tau.ci[1], sum_med$n0.ci[1]),
+  upper_ci = c(sum_med$d0.ci[2], sum_med$d1.ci[2], sum_med$z0.ci[2], sum_med$z1.ci[2], sum_med$tau.ci[2], sum_med$n0.ci[2]),
+  p_value = c(sum_med$d0.p, sum_med$d1.p, sum_med$z0.p, sum_med$z1.p, sum_med$tau.p, sum_med$n0.p)
+) %>%
+  slice(-1, -3) 
+```
+
+```{r,}
+plot(mediation_analysis,
+     sub = "Causal Mediation Analysis of Post-Murder Effect", 
+     xlab = "Effect Size",
+     ylab = "Effect")
+
+
+med_plot <- ggplot(med_data, aes(x = estimate, y = effect)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  coord_flip()+
+  labs(
+    x = "Effect Estimate",
+    y = NULL,
+    subtitle = "Causal Mediation Analysis Effects Plot"
+  ) +
+  theme_minimal()
+```
+
+
+```{r med models table, results='asis', message=FALSE, include = T}
+var_re_m <- VarCorr(mediator_model)
+var_re_o <- VarCorr(outcome_model)
+class(mediator_model) <- "lmerMod" 
+class(outcome_model) <- "lmerMod" 
+
+stargazer(mediator_model, outcome_model,
+          title = "RE ITS Panel Mediation Models of the Homicide Rate, Hennepin/Ramsey Counties 2018-2022",
+          covariate.labels = c("Time",
+                               "Post-Murder", "T Post-Murder", 
+                               "COVID - State of Emerg.", "COVID - Stay at Home",
+                               "COVID - School Closure",
+                               "COVID - Business Closure", 
+                               "Mobility Pct. Change (Google)",
+                               "COVID Cases", "COVID Deaths",
+                               "Mean Max. Temp.", "Snow (in.)", "Precip. (in.)",
+                               "Conc. Dis. (Std.)",
+                               "Police Stop Dev.",
+                               "AR(1) - Overall Hom.", 
+                               "AR(2) - Overall Hom.", 
+                               "AR(3) - Overall Hom."),
+          dep.var.caption = "",
+          column.labels = c("Police Stop Dev.", "Homicide Rate/100,000"),
+          dep.var.labels.include = FALSE,
+           report = "vcs",
+          ci=TRUE, 
+          ci.level=0.95, 
+          ci.separator = "|",
+          single.row = TRUE,
+          align = T,
+          omit.stat = c("adj.rsq", "f"),
+          font.size="footnotesize", no.space = T, column.sep.width = "1pt",
+          star.cutoffs = c(.05, .01, .001), star.char = c("*","**","***"),
+          header = F,
+          notes.append = F, 
+          type = "html",
+          add.lines = list(c("Resid. Var.", 
+                             round(attr(VarCorr(mediator_model), "sc")^2,2),
+                             round(attr(VarCorr(outcome_model), "sc")^2,2)), 
+                            c("Tract Var.", 
+                             round(var_re_m$GEOID[1,1],2),
+                             round(var_re_o$GEOID[1,1],2))),
+                    out = "Joyce Homicide Project/Analysis Output/Table_7.html")
+
+```
+
+### Policing Changes Plot
+
+```{r}
+joyce_police <- joyce_panel_mpls %>%
+  dplyr::select(GEOID, begin_date, year, week, stop_wt_3wk_dev) %>%
+  filter(year >= 2020) %>%
+  group_by(year, week) %>%
+  mutate(global_median = quantile(stop_wt_3wk_dev, .5, na.rm = T),
+         global_90 = quantile(stop_wt_3wk_dev, 0.9, na.rm = T),
+         global_10 = quantile(stop_wt_3wk_dev, 0.1, na.rm = T))
+
+
+ dev_stop <- ggplot(joyce_police, aes(x = begin_date, 
+                         y = stop_wt_3wk_dev,
+                         group = GEOID))+
+  geom_line(color = "grey", alpha = .5)+
+  geom_line(aes(y=global_median), color = "red", size = .5)+
+  geom_line(aes(y=global_90), color = "red", size = .5, linetype = "dashed")+
+  geom_line(aes(y=global_10), color = "red", size = .5, linetype = "dashed")+
+  labs(title = "Figure 5: Minneapolis Police Stop Mediation Analysis",
+       subtitle = "Neighborhood-Week TSMA(3) Deviations in Police Stops in 2020-2022",
+       captions = "Deviations are relative to the Weighted TSMA(3) of Police Stops in 2018-2019.",
+       y="Neighborhood Deviation",
+       x = "Time")+
+  theme_minimal()+
+  geom_vline(xintercept=joyce_police$begin_date[joyce_police$year==2020 &
+                        joyce_police$week==isoweek(date("2020-05-25"))][1], 
+              linetype="solid", color="blue", size=.5)+
+  geom_label(aes(x=joyce_police$begin_date[joyce_police$year==2020 &
+                   joyce_police$week==isoweek(date("2020-05-25"))][1],
+                 y=15), 
+             label = "George Floyd", show.legend = FALSE)
+```
+
+```{r}
+dev_stop+med_plot
+```
+
+
+
